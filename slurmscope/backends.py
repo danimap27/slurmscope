@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -86,7 +87,19 @@ class BaseBackend:
     def available(self) -> Tuple[bool, str]:
         return True, ""
 
-    def submit(self, script: Path, n_tasks: int, job_name: str = "sweep") -> str:
+    def submit(
+        self,
+        script: Path,
+        n_tasks: int,
+        job_name: str = "sweep",
+        array: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Envía ``script`` como job array de ``n_tasks`` tareas.
+
+        ``array`` sobrescribe la directiva ``--array`` del script (troceo) y ``env``
+        exporta variables adicionales a las tareas (``SLURMSCOPE_OFFSET``).
+        """
         raise NotImplementedError
 
     def queue(self) -> List[QueueEntry]:
@@ -104,16 +117,18 @@ class RealSlurm(BaseBackend):
 
     name = "slurm"
 
-    def __init__(self, user: Optional[str] = None, runner=None):
+    def __init__(self, user: Optional[str] = None, runner=None,
+                 workdir: Optional[Path] = None):
         self.user = user
+        self.workdir = Path(workdir) if workdir else None
         self._run = runner or self._run_command
 
     # ── utilidades ───────────────────────────────────────────────────────────
-    @staticmethod
-    def _run_command(args: Sequence[str]) -> str:
+    def _run_command(self, args: Sequence[str]) -> str:
         try:
             proc = subprocess.run(
-                list(args), capture_output=True, text=True, check=False, timeout=60
+                list(args), capture_output=True, text=True, check=False, timeout=60,
+                cwd=str(self.workdir) if self.workdir else None,
             )
         except FileNotFoundError as exc:
             raise BackendError(f"no encuentro el ejecutable {args[0]!r}") from exc
@@ -135,8 +150,29 @@ class RealSlurm(BaseBackend):
         return True, ""
 
     # ── interfaz ─────────────────────────────────────────────────────────────
-    def submit(self, script: Path, n_tasks: int, job_name: str = "sweep") -> str:
-        out = self._run(["sbatch", "--parsable", str(script)])
+    @staticmethod
+    def sbatch_args(script: Path, array: Optional[str] = None,
+                    env: Optional[Dict[str, str]] = None) -> List[str]:
+        args = ["sbatch", "--parsable"]
+        if array:
+            args.append(f"--array={array}")
+        if env:
+            for key, value in env.items():
+                if not re.match(r"^[A-Z_][A-Z0-9_]*$", key) or "," in str(value):
+                    raise BackendError(f"variable de entorno no válida para sbatch: {key}")
+            args.append("--export=ALL," + ",".join(f"{k}={v}" for k, v in env.items()))
+        args.append(str(script))
+        return args
+
+    def submit(
+        self,
+        script: Path,
+        n_tasks: int,
+        job_name: str = "sweep",
+        array: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        out = self._run(self.sbatch_args(script, array=array, env=env))
         job_id = out.strip().splitlines()[-1].split(";", 1)[0].strip()
         if not job_id:
             raise BackendError("sbatch no devolvió un identificador de job")
@@ -204,6 +240,142 @@ class RealSlurm(BaseBackend):
         self._run(["scancel", str(job_id)])
 
 
+class SSHTransport:
+    """Ejecuta órdenes en el nodo de login de un clúster por SSH.
+
+    No guarda contraseñas ni las pide: usa la configuración de ``~/.ssh/config``
+    (alias, claves, ``ProxyJump``). ``BatchMode=yes`` hace que falle en vez de
+    quedarse esperando una contraseña cuando la clave no está autorizada.
+    """
+
+    def __init__(self, host: str, remote_dir: Optional[str] = None,
+                 ssh_options: Sequence[str] = (), timeout: int = 90,
+                 runner=None):
+        if not host or host.startswith("-"):
+            raise BackendError(f"host SSH no válido: {host!r}")
+        self.host = host
+        self.remote_dir = self._relative_to_home(remote_dir) if remote_dir else None
+        self.ssh_options = list(ssh_options)
+        self.timeout = timeout
+        self._exec = runner or self._subprocess
+
+    @staticmethod
+    def _relative_to_home(path: str) -> str:
+        # ssh y rsync arrancan en $HOME: «~/x» y «x» son lo mismo, y así se evita
+        # que la tilde llegue entrecomillada (y sin expandir) al shell remoto.
+        path = path.strip()
+        if path.startswith("~/"):
+            path = path[2:]
+        return path.rstrip("/") or "."
+
+    def ssh_base(self) -> List[str]:
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+                *self.ssh_options, self.host]
+
+    def _subprocess(self, argv: Sequence[str], timeout: Optional[int] = None) -> str:
+        try:
+            proc = subprocess.run(list(argv), capture_output=True, text=True,
+                                  check=False, timeout=timeout or self.timeout)
+        except FileNotFoundError as exc:
+            raise BackendError(f"no encuentro el ejecutable {argv[0]!r}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise BackendError(
+                f"{argv[0]} hacia {self.host} ha excedido el tiempo de espera "
+                "(¿VPN o red caídas?)"
+            ) from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            tail = detail[-1] if detail else f"código {proc.returncode}"
+            if proc.returncode == 255 and argv[0] == "ssh":
+                raise BackendError(f"no se pudo conectar con {self.host}: {tail}")
+            raise BackendError(f"{self.host}: {tail}")
+        return proc.stdout
+
+    def run(self, args: Sequence[str], in_project: bool = True) -> str:
+        """Ejecuta ``args`` en el clúster (dentro del directorio del proyecto)."""
+        command = " ".join(shlex.quote(str(a)) for a in args)
+        if in_project and self.remote_dir:
+            command = f"cd {shlex.quote(self.remote_dir)} && {command}"
+        return self._exec([*self.ssh_base(), command])
+
+    def _rsync_ssh(self) -> str:
+        return " ".join(shlex.quote(x) for x in
+                        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+                         *self.ssh_options])
+
+    def push(self, local_dir: Path, excludes: Sequence[str] = ()) -> str:
+        """Sube el proyecto al clúster (sin borrar nada en el destino)."""
+        if not self.remote_dir:
+            raise BackendError("falta cluster.remote_dir para subir el proyecto")
+        if shutil.which("rsync") is None:
+            raise BackendError("no encuentro rsync en esta máquina")
+        target = shlex.quote(self.remote_dir)
+        self._exec([*self.ssh_base(),
+                    f"mkdir -p {target} {target}/logs {target}/results"])
+        argv = ["rsync", "-az", "--itemize-changes", "-e", self._rsync_ssh()]
+        for pattern in (".slurmscope/", "results/", "reports/", "logs/", ".git/",
+                        "__pycache__/", *excludes):
+            argv += ["--exclude", pattern]
+        argv += [str(Path(local_dir)) + "/", f"{self.host}:{self.remote_dir}/"]
+        return self._exec(argv, timeout=max(self.timeout, 600))
+
+    def pull(self, local_dir: Path, what: Sequence[str] = ("results",)) -> str:
+        """Descarga del clúster los directorios indicados (resultados, logs)."""
+        if not self.remote_dir:
+            raise BackendError("falta cluster.remote_dir para descargar")
+        out = []
+        for name in what:
+            if name not in ("results", "logs", "reports"):
+                raise BackendError(f"solo se pueden descargar results, logs o reports: {name}")
+            destination = Path(local_dir) / name
+            destination.mkdir(parents=True, exist_ok=True)
+            out.append(self._exec(
+                ["rsync", "-az", "--itemize-changes", "-e", self._rsync_ssh(),
+                 f"{self.host}:{self.remote_dir}/{name}/", str(destination) + "/"],
+                timeout=max(self.timeout, 1800),
+            ))
+        return "".join(out)
+
+
+class RemoteSlurm(RealSlurm):
+    """SLURM de un clúster remoto, controlado por SSH desde esta máquina.
+
+    En el clúster solo hacen falta bash y las órdenes de SLURM: SlurmScope, su libro
+    y su panel viven en local. Así funciona también en clústeres cuyo Python del
+    nodo de login es antiguo (Hércules: 3.6).
+    """
+
+    def __init__(self, transport: SSHTransport, user: Optional[str] = None):
+        super().__init__(user=user, runner=transport.run)
+        self.transport = transport
+        self.name = f"ssh:{transport.host}"
+
+    def available(self) -> Tuple[bool, str]:
+        try:
+            out = self.transport.run(
+                ["bash", "-lc", "whoami; command -v sbatch squeue sacct scancel | wc -l"],
+                in_project=False,
+            )
+        except BackendError as exc:
+            return False, str(exc)
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
+        if len(lines) < 2:
+            return False, f"respuesta inesperada de {self.transport.host}"
+        if self.user is None:
+            self.user = lines[0]
+        if lines[-1] != "4":
+            return False, f"faltan órdenes de SLURM en {self.transport.host}"
+        return True, ""
+
+    def queue(self) -> List[QueueEntry]:
+        if self.user is None:
+            ok, reason = self.available()
+            if not ok:
+                raise BackendError(reason)
+        return super().queue()
+
+
+
 class MockSlurm(BaseBackend):
     """Simulador determinista de un clúster SLURM.
 
@@ -261,7 +433,14 @@ class MockSlurm(BaseBackend):
     def available(self) -> Tuple[bool, str]:
         return True, ""
 
-    def submit(self, script: Path, n_tasks: int, job_name: str = "sweep") -> str:
+    def submit(
+        self,
+        script: Path,
+        n_tasks: int,
+        job_name: str = "sweep",
+        array: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> str:
         job_id = str(self._state["next_id"])
         self._state["next_id"] += 1
         rng = random.Random(f"{self.seed}:{job_id}")
@@ -283,6 +462,8 @@ class MockSlurm(BaseBackend):
         self._state["jobs"][job_id] = {
             "name": job_name,
             "script": str(script),
+            "array": array,
+            "env": dict(env or {}),
             "submitted_at": self._state["clock"],
             "tasks": tasks,
         }
@@ -385,21 +566,45 @@ def get_backend(
     seed: int = 20261016,
     min_seconds: float = 60.0,
     max_seconds: float = 900.0,
+    cluster: Any = None,
+    project: str = "sweep",
+    workdir: Optional[Path] = None,
 ) -> BaseBackend:
-    """Factoría de backends: ``slurm`` (real) o ``mock`` (simulado).
+    """Factoría de backends.
 
-    Los parámetros del simulador se ignoran cuando se pide el backend real.
+    * ``auto``: ``ssh`` si la especificación define ``cluster.host``; si no, ``slurm``.
+    * ``slurm``: SLURM de la máquina actual (SlurmScope corre en el nodo de login).
+    * ``ssh``: SLURM remoto por SSH, según ``cluster.host`` y ``cluster.remote_dir``.
+    * ``mock``: simulador determinista, para probar sin clúster.
+
+    Los parámetros del simulador se ignoran con los backends reales.
     """
-    key = (name or "slurm").strip().lower()
-    if key in {"slurm", "real"}:
-        return RealSlurm(user=user)
+    key = (name or "auto").strip().lower()
+    if key == "auto":
+        key = "ssh" if cluster is not None and getattr(cluster, "host", None) else "slurm"
+    if key in {"slurm", "real", "local"}:
+        return RealSlurm(user=user, workdir=workdir)
+    if key == "ssh":
+        if cluster is None or not getattr(cluster, "host", None):
+            raise BackendError(
+                "el backend ssh necesita 'cluster.host' en la especificación "
+                "(un alias de ~/.ssh/config o usuario@máquina)"
+            )
+        transport = SSHTransport(
+            cluster.host,
+            remote_dir=cluster.resolved_remote_dir(project),
+            ssh_options=cluster.ssh_options,
+        )
+        return RemoteSlurm(transport, user=user)
     if key == "mock":
         return MockSlurm(
             mock_state or Path(".slurmscope/mock_cluster.json"),
             seed=seed,
             parallel=parallel,
+            failure_rate=failure_rate,
             min_seconds=min_seconds,
             max_seconds=max_seconds,
-            failure_rate=failure_rate,
         )
-    raise BackendError(f"backend desconocido: {name!r} (usa 'slurm' o 'mock')")
+    raise BackendError(
+        f"backend desconocido {name!r}: usa auto, slurm, ssh o mock"
+    )

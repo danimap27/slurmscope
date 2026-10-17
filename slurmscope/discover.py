@@ -164,5 +164,11 @@ def aggregate_metrics(
             continue
         mean = sum(values) / len(values)
         var = sum((v - mean) ** 2 for v in values) / len(values)
-        result[key] = {"n": float(len(values)), "mean": mean, "std": var ** 0.5}
+        result[key] = {
+            "n": float(len(values)),
+            "mean": mean,
+            "std": var ** 0.5,
+            "min": min(values),
+            "max": max(values),
+        }
     return result

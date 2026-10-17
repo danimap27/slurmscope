@@ -99,7 +99,7 @@ class TestConfig(unittest.TestCase):
 
     def test_opciones_slurm_por_defecto(self):
         opts = SlurmOptions.from_mapping(None)
-        self.assertEqual(opts.partition, "standard")
+        self.assertIsNone(opts.partition)  # la decide el perfil o el clúster
         self.assertEqual(opts.cpus_per_task, 4)
         self.assertEqual(opts.max_parallel, 0)
 

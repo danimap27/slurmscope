@@ -389,19 +389,71 @@ def write_markdown(dash: Dashboard, path: Path) -> Path:
     return path
 
 
-def write_json(dash: Dashboard, path: Path) -> Path:
-    """Volcado estructurado del panel, para consumirlo desde otros scripts."""
-    payload = {
-        "project": dash.spec.project,
+def dashboard_payload(dash: Dashboard, ledger: Optional[Ledger] = None) -> Dict[str, Any]:
+    """Volcado estructurado del panel (lo usan el informe JSON y el panel web).
+
+    Con ``ledger`` se añade, para cada ejecución, su estado más reciente en el libro
+    (estado, duración, código de salida y job de SLURM).
+    """
+    spec = dash.spec
+    latest: Dict[str, RunRecord] = {}
+    if ledger is not None:
+        for record in ledger.runs(project=spec.project):  # más reciente primero
+            latest.setdefault(record.run_key, record)
+
+    def run_entry(run: Run) -> Dict[str, Any]:
+        outcome = dash.outcomes.get(run.key)
+        record = latest.get(run.key)
+        return {
+            "index": run.index,
+            "key": run.key,
+            "params": run.params,
+            "disk": outcome.status if outcome else None,
+            "metrics": outcome.metrics if outcome else {},
+            "state": record.state if record else None,
+            "seconds": record.seconds if record else dash.durations.get(run.key),
+            "exit_code": record.exit_code if record else None,
+            "slurm_job_id": record.slurm_job_id if record else None,
+        }
+
+    return {
+        "project": spec.project,
         "generated_at": dash.generated_at,
+        "cluster": {
+            "profile": spec.cluster.profile,
+            "host": spec.cluster.host,
+            "partition": spec.effective_partition,
+            "account": spec.slurm.account,
+            "qos": spec.slurm.qos,
+            "max_array_size": spec.cluster.effective_max_array_size(),
+        },
+        "slurm": {
+            "time": spec.slurm.time,
+            "cpus_per_task": spec.slurm.cpus_per_task,
+            "mem": spec.slurm.mem,
+            "max_parallel": spec.slurm.max_parallel,
+        },
+        "sweep": {name: list(values) for name, values in spec.sweep.items()},
         "total": dash.n_total,
         "counts": dash.counts,
+        "on_disk": dash.n_on_disk,
         "progress": dash.progress,
-        "estimate": dash.estimate.as_dict(),
+        "estimate": dict(dash.estimate.as_dict(), eta=dash.estimate.eta()),
         "metrics": dash.metrics,
+        "warnings": list(dash.warnings) + ([dash.scan_error] if dash.scan_error else []),
+        "queue": [
+            dict(e.as_dict(), name=getattr(e, "name", ""), detail=getattr(e, "detail", ""))
+            for e in dash.queue if hasattr(e, "as_dict")
+        ],
+        "failures": [
+            {"submission_id": r.submission_id, "task_index": r.task_index,
+             "key": r.run_key, "exit_code": r.exit_code, "ended_at": r.ended_at}
+            for r in dash.failures
+        ],
         "submissions": [
             {
                 "id": s.id,
+                "backend": s.backend,
                 "array_job_id": s.array_job_id,
                 "n_runs": s.n_runs,
                 "status": s.status,
@@ -409,17 +461,13 @@ def write_json(dash: Dashboard, path: Path) -> Path:
             }
             for s in dash.submissions
         ],
-        "runs": [
-            {
-                "index": run.index,
-                "key": run.key,
-                "params": run.params,
-                "disk": dash.outcomes.get(run.key).status if run.key in dash.outcomes else None,
-                "metrics": dash.outcomes.get(run.key).metrics if run.key in dash.outcomes else {},
-            }
-            for run in dash.runs
-        ],
+        "runs": [run_entry(run) for run in dash.runs],
     }
+
+
+def write_json(dash: Dashboard, path: Path, ledger: Optional[Ledger] = None) -> Path:
+    """Volcado estructurado del panel, para consumirlo desde otros scripts."""
+    payload = dashboard_payload(dash, ledger)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return path

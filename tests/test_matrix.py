@@ -78,7 +78,9 @@ class TestMatrix(unittest.TestCase):
         self.assertIn("#SBATCH --partition=standard", script)
         self.assertIn("#SBATCH --array=1-8%4", script)
         self.assertIn("#SBATCH --time=01:00:00", script)
-        self.assertIn("sed -n \"${SLURM_ARRAY_TASK_ID}p\"", script)
+        self.assertIn('LINE=$(( SLURM_ARRAY_TASK_ID + OFFSET ))', script)
+        self.assertIn('sed -n "${LINE}p"', script)
+        self.assertIn('COMMANDS_FILE="plan/commands.txt"', script)  # relativo: vale en remoto
         self.assertIn("exit ${status}", script)
 
     def test_script_sin_tope_de_paralelismo(self):

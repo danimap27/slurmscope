@@ -9,9 +9,12 @@ se envía el job array a SLURM.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+from .clusters import ClusterConfig, ClusterConfigError, get_profile
 
 DEFAULT_SPEC_NAMES = ("sweep.yaml", "sweep.yml", "sweep.json")
 
@@ -25,7 +28,11 @@ class SlurmOptions:
     """Opciones de envío del job array."""
 
     job_name: str = "sweep"
-    partition: str = "standard"
+    # None: la del perfil de clúster, y si el perfil no fija ninguna, la partición
+    # por defecto del propio clúster (no se escribe la directiva).
+    partition: Optional[str] = None
+    account: Optional[str] = None
+    qos: Optional[str] = None
     time: str = "08:00:00"
     cpus_per_task: int = 4
     mem: str = "16G"
@@ -41,8 +48,8 @@ class SlurmOptions:
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "SlurmOptions":
         data = data or {}
         known = {
-            "job_name", "partition", "time", "cpus_per_task", "mem",
-            "max_parallel", "log_dir", "conda_base", "conda_env", "setup",
+            "job_name", "partition", "account", "qos", "time", "cpus_per_task",
+            "mem", "max_parallel", "log_dir", "conda_base", "conda_env", "setup",
             "extra_sbatch", "shebang",
         }
         unknown = set(data) - known
@@ -58,6 +65,20 @@ class SlurmOptions:
             kwargs["cpus_per_task"] = _as_int(kwargs["cpus_per_task"], "slurm.cpus_per_task")
         if "max_parallel" in kwargs:
             kwargs["max_parallel"] = _as_int(kwargs["max_parallel"], "slurm.max_parallel")
+        for key in ("partition", "account", "qos"):
+            value = kwargs.get(key)
+            if value is None or value == "":
+                kwargs[key] = None
+                continue
+            if not isinstance(value, str) or not _SAFE_DIRECTIVE.match(value):
+                raise ConfigError(
+                    f"slurm.{key} solo admite letras, números, '_', '-', '.' y ',' "
+                    f"(recibido {value!r})"
+                )
+        extra = kwargs.get("extra_sbatch")
+        if extra is not None:
+            if not isinstance(extra, list) or not all(isinstance(x, str) for x in extra):
+                raise ConfigError("slurm.extra_sbatch debe ser una lista de cadenas")
         return cls(**kwargs)
 
 
@@ -73,7 +94,15 @@ class SweepSpec:
     run_id: str = "{index:04d}"
     create_run_dirs: bool = True
     slurm: SlurmOptions = field(default_factory=SlurmOptions)
+    cluster: ClusterConfig = field(default_factory=ClusterConfig)
     raw: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def effective_partition(self) -> Optional[str]:
+        """Partición a pedir: la de la especificación o, si no hay, la del perfil."""
+        if self.slurm.partition:
+            return self.slurm.partition
+        return get_profile(self.cluster.profile).partition
 
     @property
     def n_runs(self) -> int:
@@ -100,6 +129,9 @@ class SweepSpec:
         if path.is_absolute():
             return path
         return (self.source.parent / path).resolve()
+
+
+_SAFE_DIRECTIVE = re.compile(r"^[A-Za-z0-9_.,\-]+$")
 
 
 def _as_int(value: Any, where: str) -> int:
@@ -199,7 +231,7 @@ def load_spec(path: Optional[Path] = None) -> SweepSpec:
 
     unknown_top = set(data) - {
         "project", "command", "sweep", "run_id", "results_root", "slurm",
-        "description", "version", "create_run_dirs",
+        "description", "version", "create_run_dirs", "cluster",
     }
     if unknown_top:
         raise ConfigError("claves desconocidas en la especificación: " + ", ".join(sorted(unknown_top)))
@@ -207,6 +239,11 @@ def load_spec(path: Optional[Path] = None) -> SweepSpec:
     create_run_dirs = data.get("create_run_dirs", True)
     if not isinstance(create_run_dirs, bool):
         raise ConfigError("'create_run_dirs' debe ser true o false")
+
+    try:
+        cluster = ClusterConfig.from_mapping(data.get("cluster"))
+    except ClusterConfigError as exc:
+        raise ConfigError(str(exc)) from None
 
     return SweepSpec(
         project=project,
@@ -217,5 +254,6 @@ def load_spec(path: Optional[Path] = None) -> SweepSpec:
         run_id=run_id,
         create_run_dirs=create_run_dirs,
         slurm=SlurmOptions.from_mapping(data.get("slurm")),
+        cluster=cluster,
         raw=data,
     )

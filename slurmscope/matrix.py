@@ -152,30 +152,60 @@ def _conda_block(spec: SweepSpec) -> List[str]:
     return lines
 
 
-def render_slurm_script(spec: SweepSpec, runs: Sequence[Run], commands_file: str) -> str:
-    """Genera el script de job array que ejecuta un comando por tarea."""
+def render_slurm_script(
+    spec: SweepSpec, runs: Sequence[Run], commands_file: str = "plan/commands.txt"
+) -> str:
+    """Genera el script de job array que ejecuta un comando por tarea.
+
+    ``commands_file`` debe ser relativo al directorio del proyecto: el script hace
+    ``cd`` al directorio de envío, así que funciona igual en local que en la copia
+    remota del proyecto en el clúster.
+
+    Si el barrido no cabe en un array (``MaxArraySize``), se envía en varios trozos
+    con el mismo script: cada envío sobrescribe ``--array`` y exporta
+    ``SLURMSCOPE_OFFSET``, y la tarea ejecuta la línea ``SLURM_ARRAY_TASK_ID + offset``.
+    """
     opts = spec.slurm
     n_runs = len(runs)
-    array_expr = f"1-{n_runs}" + (f"%{opts.max_parallel}" if opts.max_parallel > 0 else "")
+    max_array = spec.cluster.effective_max_array_size()
+    first_chunk = min(n_runs, max(1, max_array - 1))
+    array_expr = f"1-{first_chunk}" + (f"%{opts.max_parallel}" if opts.max_parallel > 0 else "")
+    partition = spec.effective_partition
 
     header = [
         opts.shebang,
         f"#SBATCH --job-name={opts.job_name}",
         f"#SBATCH --output={opts.log_dir.rstrip('/')}/%x_%A_%a.out",
         f"#SBATCH --error={opts.log_dir.rstrip('/')}/%x_%A_%a.err",
-        f"#SBATCH --partition={opts.partition}",
-        f"#SBATCH --time={opts.time}",
-        f"#SBATCH --cpus-per-task={opts.cpus_per_task}",
-        f"#SBATCH --mem={opts.mem}",
-        f"#SBATCH --array={array_expr}",
     ]
+    if partition:
+        header.append(f"#SBATCH --partition={partition}")
+    if opts.account:
+        header.append(f"#SBATCH --account={opts.account}")
+    if opts.qos:
+        header.append(f"#SBATCH --qos={opts.qos}")
+    header.extend(
+        [
+            f"#SBATCH --time={opts.time}",
+            f"#SBATCH --cpus-per-task={opts.cpus_per_task}",
+            f"#SBATCH --mem={opts.mem}",
+            f"#SBATCH --array={array_expr}",
+        ]
+    )
     header.extend(opts.extra_sbatch or [])
 
+    chunks_note = (
+        f"# Se envía en trozos de hasta {max_array - 1} tareas (MaxArraySize={max_array})"
+        if n_runs > first_chunk
+        else f"# Cabe en un único job array (MaxArraySize={max_array})"
+    )
     body = [
         "",
         "# ─────────────────────────────────────────────────────────────",
         f"# Generado por SlurmScope para el barrido '{spec.project}'",
         f"# {n_runs} ejecuciones · máximo {opts.max_parallel or 'sin tope'} en paralelo",
+        f"# Perfil de clúster: {spec.cluster.profile}",
+        chunks_note,
         "# ─────────────────────────────────────────────────────────────",
         "",
         "set -u",
@@ -194,19 +224,21 @@ def render_slurm_script(spec: SweepSpec, runs: Sequence[Run], commands_file: str
             "    exit 1",
             "fi",
             "",
-            'CMD=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$COMMANDS_FILE")',
+            'OFFSET="${SLURMSCOPE_OFFSET:-0}"',
+            'LINE=$(( SLURM_ARRAY_TASK_ID + OFFSET ))',
+            'CMD=$(sed -n "${LINE}p" "$COMMANDS_FILE")',
             'if [ -z "$CMD" ]; then',
-            '    echo "[slurmscope] no hay comando para la tarea ${SLURM_ARRAY_TASK_ID}" >&2',
+            '    echo "[slurmscope] no hay comando para la línea ${LINE}" >&2',
             "    exit 1",
             "fi",
             "",
             "# El fichero de comandos lo genera SlurmScope en la máquina de envío a partir",
             "# de la especificación del barrido, así que se ejecuta con eval para respetar",
             "# comillas y redirecciones. No lo edites a mano en el clúster.",
-            'echo "task=${SLURM_ARRAY_TASK_ID} array=${SLURM_ARRAY_JOB_ID} inicio=$(date --iso-8601=seconds)"',
+            'echo "task=${SLURM_ARRAY_TASK_ID} run=${LINE} array=${SLURM_ARRAY_JOB_ID} inicio=$(date --iso-8601=seconds)"',
             'eval "$CMD"',
             'status=$?',
-            'echo "task=${SLURM_ARRAY_TASK_ID} fin=$(date --iso-8601=seconds) status=${status}"',
+            'echo "task=${SLURM_ARRAY_TASK_ID} run=${LINE} fin=$(date --iso-8601=seconds) status=${status}"',
             "exit ${status}",
             "",
         ]
@@ -229,7 +261,9 @@ def plan_summary(spec: SweepSpec, runs: Sequence[Run], limit: int = 3) -> str:
         f"ejecuciones   : {len(runs)}",
         f"parámetros    : {', '.join(f'{k}×{len(v)}' for k, v in spec.sweep.items())}",
         f"resultados en : {spec.results_path()}",
-        f"partición     : {spec.slurm.partition} · {spec.slurm.time} · "
+        f"clúster       : {spec.cluster.profile}"
+        + (f" vía {spec.cluster.host}" if spec.cluster.host else " (local)"),
+        f"partición     : {spec.effective_partition or 'por defecto'} · {spec.slurm.time} · "
         f"{spec.slurm.cpus_per_task} CPU · {spec.slurm.mem}",
         f"paralelismo   : {spec.slurm.max_parallel or 'sin tope'}",
     ]

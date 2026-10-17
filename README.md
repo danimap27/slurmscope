@@ -1,7 +1,11 @@
 # SlurmScope
 
 **Orquestador de barridos de experimentos en clústeres SLURM** con panel de resultados,
-historial de ejecuciones y estimación de tiempos.
+historial de ejecuciones y estimación de tiempos. Funciona en Hércules (CICA), en los
+nodos de la Red Española de Supercomputación y en cualquier clúster SLURM, en local o
+por SSH desde tu máquina.
+
+[![pruebas](https://github.com/danimap27/slurmscope/actions/workflows/tests.yml/badge.svg)](https://github.com/danimap27/slurmscope/actions/workflows/tests.yml)
 
 Escribes una especificación de barrido en YAML, y SlurmScope se encarga de expandir el
 producto cartesiano, generar el job array, enviarlo, seguir su estado y darte un panel
@@ -13,6 +17,14 @@ donde ver qué ha terminado, qué falta, cuánto tarda cada cosa y cuánto queda
   así que el ciclo completo se puede ejecutar y probar en un portátil.
 - **Con historial.** Cada envío y cada tarea quedan registrados en un libro SQLite local:
   estados, códigos de salida y duraciones reales.
+- **Para cualquier centro.** Perfiles de Hércules, MareNostrum 5, FinisTerrae III,
+  Tirant, Picasso y Caléndula; `slurmscope probe` lee del clúster lo que no se sabe.
+- **Por SSH.** SlurmScope corre en tu máquina; en el clúster solo hacen falta bash y
+  SLURM (vale aunque el Python del nodo de login sea antiguo).
+- **Sin límites de array.** Los barridos que no caben en `MaxArraySize` se trocean
+  solos en varios job arrays.
+- **Con panel web.** `slurmscope serve` publica el estado de varios barridos en el
+  navegador, en solo lectura.
 - **Con estimaciones útiles.** Tiempo de cómputo pendiente y tiempo de pared, calculados
   a partir del histórico real (mediana o percentil 90) y del paralelismo del job array.
 
@@ -85,6 +97,72 @@ slurm:
 En `command` puedes usar cualquier parámetro del barrido y además `{index}`, `{key}`,
 `{run_dir}` y `{plan_out}`.
 
+## Clústeres: RES, Hércules y cualquier SLURM
+
+Todos los nodos de la RES consultados y Hércules usan SLURM. Lo que cambia de un centro a
+otro son sus reglas, y eso es lo que recoge cada perfil:
+
+| Perfil | Máquina | Login | Reglas |
+|---|---|---|---|
+| `hercules` | Hércules · CICA | `login.spc.cica.es` (VPN) | partición `standard`, `MaxArraySize=500` |
+| `marenostrum5-gpp` | MareNostrum 5 GPP · BSC | `glogin1.bsc.es` | `account` y `qos` obligatorias (`gp_resa/b/c`) |
+| `marenostrum5-acc` | MareNostrum 5 ACC · BSC | `alogin1.bsc.es` | `account` y `qos` obligatorias (`acc_resa/b/c`), GPU con `--gres` |
+| `finisterrae3` | FinisTerrae III · CESGA | — | QoS automática (no indicarla salvo `class_a/b/c`) |
+| `tirant` | Tirant · UV | `tirant.uv.es` | — |
+| `picasso` | Picasso · UMA | — | usar `probe` |
+| `calendula` | Caléndula · SCAYLE | — | usar `probe` |
+| `generic` | cualquier SLURM | — | usar `probe` |
+
+Solo figuran datos comprobados (en el clúster o en la guía oficial del centro). Lo demás
+se deja vacío a propósito: `slurmscope probe` lo pregunta al clúster (versión de SLURM,
+`MaxArraySize`, particiones, cuentas y QoS) en una sola sesión SSH.
+
+```yaml
+cluster:
+  profile: hercules          # slurmscope clusters
+  host: hercules-cica        # alias de ~/.ssh/config: activa el backend ssh
+  remote_dir: slurmscope/{project}
+  # max_array_size: 500      # solo si quieres imponer otro valor
+slurm:
+  # account: mi_proyecto     # obligatorio en MareNostrum 5
+  # qos: gp_resb
+```
+
+Con `host`, todas las órdenes de SLURM se ejecutan por SSH (`BatchMode=yes`: si la clave
+no está autorizada falla en vez de pedir contraseña) y el proyecto se sube con `rsync`
+antes de cada envío, sin borrar nada en el destino. Los resultados se traen con
+`slurmscope pull` (`--logs` para los logs).
+
+Antes de enviar se comprueban las reglas del centro (por ejemplo, la cuenta y la QoS en
+MareNostrum 5): el error sale en tu terminal, no en la cola del clúster.
+
+### Barridos más grandes que `MaxArraySize`
+
+SLURM rechaza un array con índices iguales o mayores que `MaxArraySize`. SlurmScope parte
+el barrido en trozos (en Hércules, 1200 ejecuciones = 499 + 499 + 202), envía el mismo
+script con `--array=1-N` y `SLURMSCOPE_OFFSET`, y cada tarea ejecuta la línea
+`SLURM_ARRAY_TASK_ID + offset`. Cada trozo es un envío distinto en el historial.
+
+Verificado en Hércules el 17-10-2026: 6 ejecuciones en 2 job arrays (`5355721`,
+`5355722`), 6/6 `COMPLETED`, y la tarea 1 del segundo array ejecutó la línea 4.
+
+## Panel web
+
+```bash
+slurmscope serve --project exp-hercules --project exp-mn5 --port 8120
+```
+
+Una pestaña por barrido, con: avance por estados, estimación, historial de envíos,
+ejecuciones filtrables (estado, búsqueda) con sus métricas, agregado de métricas, fallos,
+cola del clúster y descarga en CSV. Es **de solo lectura**: no envía ni cancela nada.
+
+La sincronización corre en un hilo aparte. Un clúster real se consulta como mucho cada 2
+minutos, y nunca cuando no queda nada pendiente: el nodo de login es compartido.
+
+Para demostraciones, un directorio con el fichero `.slurmscope-demo` usa siempre el
+simulador, y con `--demo-tick S` avanza solo, genera métricas simuladas y se reinicia al
+terminar. Sin ese fichero, el modo demo nunca escribe ni borra resultados.
+
 ## Comandos
 
 | Comando | Para qué |
@@ -102,8 +180,12 @@ En `command` puedes usar cualquier parámetro del barrido y además `{index}`, `
 | `sync` | Vuelca el estado del clúster en el libro |
 | `cancel` | Cancela un job array |
 | `mock` | Avanza el clúster simulado (pruebas y demostraciones) |
+| `clusters` | Perfiles de clúster incluidos (`--name` para el detalle) |
+| `probe` | Lee del clúster sus límites, particiones, cuentas y QoS |
+| `push` / `pull` | Sube el proyecto / descarga resultados del clúster remoto |
+| `serve` | Panel web de uno o varios barridos |
 
-Opciones globales: `-C/--directory`, `-s/--spec`, `--backend {slurm,mock}`,
+Opciones globales: `-C/--directory`, `-s/--spec`, `--backend {auto,slurm,ssh,mock}`,
 `--mock-parallel`, `--fail-rate`.
 
 ## Cómo detecta los resultados
@@ -131,7 +213,7 @@ superior. Se muestran dos cifras distintas:
 make test          # o: PYTHONPATH=. python3 -m unittest discover -s tests -t tests
 ```
 
-80 casos de prueba sobre la biblioteca estándar (`unittest`), sin dependencias: lector
+133 casos de prueba sobre la biblioteca estándar (`unittest`), sin dependencias: lector
 YAML propio, validación de la especificación, expansión del barrido, generación del job
 array, libro de ejecuciones, parseo de `squeue`/`sacct`, simulador, inspección de
 resultados, estimaciones y un ciclo completo de integración por la CLI.
@@ -142,18 +224,20 @@ resultados, estimaciones y un ciclo completo de integración por la CLI.
 slurmscope/
   config.py      carga y valida la especificación
   matrix.py      producto cartesiano, comandos y script de job array
-  backends.py    backend SLURM real y simulador determinista
+  clusters.py    perfiles de centro, troceo de arrays y sondeo del clúster
+  backends.py    SLURM local, SLURM por SSH y simulador determinista
   ledger.py      libro de ejecuciones (SQLite)
   sync.py        reconciliación libro ↔ clúster
   discover.py    inspección de resultados en disco
   estimate.py    estimaciones de tiempo
   report.py      panel, tablas e informes exportables
   tui.py         menú interactivo
+  web.py         panel web de solo lectura
   miniyaml.py    lector YAML sin dependencias
   cli.py         interfaz de línea de comandos
 docs/            memoria técnica y guía de registro
 examples/        demo reproducible y runner de ejemplo
-tests/           80 casos de prueba
+tests/           133 casos de prueba
 ```
 
 ## Licencia

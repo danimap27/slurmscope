@@ -1,7 +1,8 @@
 """Interfaz de línea de comandos de SlurmScope.
 
 Comandos: ``init``, ``plan``, ``gen``, ``submit``, ``status``, ``menu``, ``queue``,
-``results``, ``estimate``, ``report``, ``sync``, ``cancel`` y ``mock``.
+``results``, ``estimate``, ``report``, ``sync``, ``cancel``, ``mock``, ``clusters``,
+``probe``, ``push``, ``pull`` y ``serve``.
 """
 
 from __future__ import annotations
@@ -14,7 +15,14 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from . import __version__
-from .backends import BackendError, get_backend
+from .backends import BackendError, RemoteSlurm, get_backend
+from .clusters import (
+    PROFILES,
+    check_submission_rules,
+    get_profile,
+    plan_chunks,
+    probe_cluster,
+)
 from .config import ConfigError, SweepSpec, load_spec
 from .estimate import estimate_remaining, format_seconds, limit_seconds
 from .ledger import Ledger
@@ -53,9 +61,19 @@ sweep:
   depth: [1, 3]
   seed: [1, 2, 3]
 
+# Dónde se ejecuta. `slurmscope clusters` lista los perfiles incluidos (Hércules,
+# MareNostrum 5, FinisTerrae III, Tirant…). Con `host`, SlurmScope corre en esta
+# máquina y controla el clúster por SSH (alias de ~/.ssh/config).
+cluster:
+  profile: hercules
+  # host: hercules-cica
+  # remote_dir: slurmscope/{project}
+
 slurm:
   job_name: ejemplo
-  partition: standard
+  # partition: standard     # por defecto, la del perfil o la del clúster
+  # account: mi_proyecto    # obligatorio en MareNostrum 5
+  # qos: gp_resb            # obligatorio en MareNostrum 5
   time: "08:00:00"
   cpus_per_task: 4
   mem: 16G
@@ -87,11 +105,49 @@ def open_ledger(spec: SweepSpec) -> Ledger:
 
 def _backend_for(args, spec: SweepSpec):
     return get_backend(
-        getattr(args, "backend", "slurm"),
+        getattr(args, "backend", None) or "auto",
         mock_state=state_dir(spec) / "mock_cluster.json",
-        parallel=getattr(args, "mock_parallel", 4),
-        failure_rate=getattr(args, "fail_rate", 0.0),
+        parallel=getattr(args, "mock_parallel", None) or 4,
+        failure_rate=getattr(args, "fail_rate", None) or 0.0,
+        cluster=spec.cluster,
+        project=spec.project,
+        workdir=spec.source.parent,
     )
+
+
+def submit_sweep(spec: SweepSpec, backend, ledger: Ledger, runs: Sequence,
+                 artifacts: dict, log=print) -> List[str]:
+    """Envía el barrido completo, troceado según ``MaxArraySize`` del clúster.
+
+    Con un backend remoto, primero sube el proyecto (código, plan y especificación).
+    Cada trozo es un envío distinto en el libro, con su propio job array. Si un trozo
+    falla, los ya enviados quedan registrados y el error se propaga.
+    """
+    if isinstance(backend, RemoteSlurm):
+        log(f"subiendo el proyecto a {backend.transport.host}:{backend.transport.remote_dir}")
+        backend.transport.push(spec.source.parent, excludes=spec.cluster.push_exclude)
+
+    chunks = plan_chunks(len(runs), spec.cluster.effective_max_array_size())
+    script = artifacts["script"].relative_to(spec.source.parent)
+    commands = str(artifacts["commands"].relative_to(spec.source.parent))
+    job_ids: List[str] = []
+    for chunk in chunks:
+        env = {"SLURMSCOPE_OFFSET": str(chunk.offset)} if chunk.offset else None
+        array = chunk.array_spec(spec.slurm.max_parallel) if len(chunks) > 1 else None
+        job_id = backend.submit(script, chunk.size, job_name=spec.slurm.job_name,
+                                array=array, env=env)
+        chunk_runs = list(runs)[chunk.offset:chunk.offset + chunk.size]
+        submission_id = ledger.record_submission(
+            project=spec.project, backend=backend.name, n_runs=chunk.size,
+            runs=chunk_runs, array_job_id=str(job_id), commands_file=commands,
+            task_offset=chunk.offset,
+        )
+        job_ids.append(str(job_id))
+        label = (f" · trozo {chunk.number}/{len(chunks)} (ejecuciones "
+                 f"{chunk.first_run}-{chunk.last_run})") if len(chunks) > 1 else ""
+        log(f"envío #{submission_id} registrado · job array {job_id} · "
+            f"{chunk.size} tareas{label}")
+    return job_ids
 
 
 def _load(args) -> SweepSpec:
@@ -122,7 +178,7 @@ def _generate(spec: SweepSpec, runs: Sequence, force: bool = False) -> dict:
     spec.results_path().mkdir(parents=True, exist_ok=True)
 
     write_command_file(spec, runs, commands_file)
-    script = render_slurm_script(spec, runs, str(commands_file))
+    script = render_slurm_script(spec, runs, "plan/commands.txt")
     script_file.write_text(script, encoding="utf-8")
     script_file.chmod(0o755)
 
@@ -134,8 +190,15 @@ def _generate(spec: SweepSpec, runs: Sequence, force: bool = False) -> dict:
                 "project": spec.project,
                 "n_runs": len(runs),
                 "sweep": {k: list(v) for k, v in spec.sweep.items()},
+                "cluster": {
+                    "profile": spec.cluster.profile,
+                    "host": spec.cluster.host,
+                    "max_array_size": spec.cluster.effective_max_array_size(),
+                },
                 "slurm": {
-                    "partition": spec.slurm.partition,
+                    "partition": spec.effective_partition,
+                    "account": spec.slurm.account,
+                    "qos": spec.slurm.qos,
                     "time": spec.slurm.time,
                     "cpus_per_task": spec.slurm.cpus_per_task,
                     "mem": spec.slurm.mem,
@@ -187,11 +250,17 @@ def cmd_gen(args) -> int:
     print(f"  comandos : {artifacts['commands']}")
     print(f"  script   : {artifacts['script']}")
     print(f"  manifiesto: {artifacts['manifest']}")
+    chunks = plan_chunks(len(runs), spec.cluster.effective_max_array_size())
+    if len(chunks) > 1:
+        print(f"  troceo    : {len(chunks)} job arrays (MaxArraySize="
+              f"{spec.cluster.effective_max_array_size()})")
+    for problem in check_submission_rules(get_profile(spec.cluster.profile),
+                                          spec.slurm.account, spec.slurm.qos):
+        print(f"  aviso     : {problem}")
     if args.backend == "mock":
         print("\nlanza el ciclo simulado con:  slurmscope submit --backend mock")
     else:
-        print("\nenvía con:  sbatch " + str(artifacts["script"]))
-        print("o con registro en el libro:  slurmscope submit")
+        print("\nenvía y registra en el libro con:  slurmscope submit")
     return 0
 
 
@@ -202,41 +271,45 @@ def cmd_submit(args) -> int:
     artifacts = _generate(spec, runs, force=True)
     backend = _backend_for(args, spec)
 
+    if backend.name != "mock":
+        problems = check_submission_rules(get_profile(spec.cluster.profile),
+                                          spec.slurm.account, spec.slurm.qos)
+        if problems:
+            for problem in problems:
+                print(f"error: {problem}", file=sys.stderr)
+            return 2
+
+    chunks = plan_chunks(len(runs), spec.cluster.effective_max_array_size())
+    where = backend.name
+    if args.dry_run:
+        print(f"dry-run: no se envía nada ({where})")
+        for chunk in chunks:
+            extra = f" --array={chunk.array_spec(spec.slurm.max_parallel)}" if len(chunks) > 1 else ""
+            env = f" --export=ALL,SLURMSCOPE_OFFSET={chunk.offset}" if chunk.offset else ""
+            print(f"  sbatch --parsable{extra}{env} plan/submit_array.slurm   "
+                  f"# ejecuciones {chunk.first_run}-{chunk.last_run}")
+        return 0
+
     ok, reason = backend.available()
     if not ok:
         print(f"backend no disponible: {reason}", file=sys.stderr)
         return 1
 
-    command = ["sbatch", str(artifacts["script"])]
-    if args.dry_run:
-        print("dry-run: no se envía nada")
-        print("  " + " ".join(command))
-        print(f"  ({len(runs)} tareas)")
-        return 0
-
-    if args.backend != "mock" and not args.yes:
-        answer = input(f"¿Enviar {len(runs)} ejecuciones con {spec.slurm.partition}? [s/N] ")
+    if backend.name != "mock" and not args.yes:
+        answer = input(
+            f"¿Enviar {len(runs)} ejecuciones en {len(chunks)} job array(s) a {where}? [s/N] "
+        )
         if answer.strip().lower() not in {"s", "y", "si", "sí"}:
             print("cancelado")
             return 1
 
+    ledger = open_ledger(spec)
     try:
-        job_id = backend.submit(artifacts["script"], len(runs), job_name=spec.slurm.job_name)
+        submit_sweep(spec, backend, ledger, runs, artifacts)
     except BackendError as exc:
         print(f"error al enviar: {exc}", file=sys.stderr)
         return 1
-
-    ledger = open_ledger(spec)
-    submission_id = ledger.record_submission(
-        project=spec.project,
-        backend=backend.name,
-        n_runs=len(runs),
-        runs=runs,
-        array_job_id=str(job_id),
-        commands_file=str(artifacts["commands"]),
-    )
-    print(f"envío #{submission_id} registrado · job array {job_id} · {len(runs)} tareas")
-    print("sigue el avance con:  slurmscope status   o   slurmscope menu")
+    print("sigue el avance con:  slurmscope status   ·   slurmscope menu   ·   slurmscope serve")
     return 0
 
 
@@ -266,30 +339,25 @@ def cmd_menu(args) -> int:
         runs = expand_runs(spec)
         artifacts = _generate(spec, runs, force=True)
         try:
-            job_id = backend.submit(
-                artifacts["script"], len(runs), job_name=spec.slurm.job_name
-            )
+            job_ids = submit_sweep(spec, backend, ledger, runs, artifacts, log=lambda _m: None)
         except BackendError as exc:
             return f"error al enviar: {exc}"
-        ledger.record_submission(
-            project=spec.project, backend=backend.name, n_runs=len(runs), runs=runs,
-            array_job_id=str(job_id), commands_file=str(artifacts["commands"]),
-        )
-        return f"enviado: job array {job_id}"
+        return "enviado: job array " + ", ".join(job_ids)
 
     def do_cancel() -> Optional[str]:
-        submissions = ledger.submissions(project=spec.project)
-        active = [s for s in submissions if s.array_job_id]
-        if not active:
-            return "no hay envíos que cancelar"
+        job_ids = _active_job_ids(ledger, spec.project)
+        if not job_ids:
+            return "no hay job arrays activos que cancelar"
         try:
-            backend.cancel(str(active[0].array_job_id))
+            for job_id in job_ids:
+                backend.cancel(job_id)
         except BackendError as exc:
             return f"error al cancelar: {exc}"
-        return f"cancelado el job array {active[0].array_job_id}"
+        sync_states(ledger, backend, project=spec.project)
+        return "cancelado " + ", ".join(job_ids)
 
     actions.append(MenuAction("e", "Enviar barrido", do_submit))
-    actions.append(MenuAction("c", "Cancelar último envío", do_cancel))
+    actions.append(MenuAction("c", "Cancelar envíos activos", do_cancel))
     return run_menu(refresh, actions, force_plain=args.plain)
 
 
@@ -348,7 +416,7 @@ def cmd_report(args) -> int:
 
     out_dir = Path(args.out) if args.out else spec.source.parent / "reports"
     md_path = write_markdown(dash, Path(args.md) if args.md else out_dir / f"{spec.project}-informe.md")
-    json_path = write_json(dash, Path(args.json) if args.json else out_dir / f"{spec.project}-estado.json")
+    json_path = write_json(dash, Path(args.json) if args.json else out_dir / f"{spec.project}-estado.json", ledger)
     csv_path = ledger.export_csv(
         Path(args.csv) if args.csv else out_dir / f"{spec.project}-ejecuciones.csv",
         project=spec.project,
@@ -373,25 +441,38 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def _active_job_ids(ledger: Ledger, project: str) -> List[str]:
+    """Job arrays del proyecto con alguna tarea todavía pendiente o en ejecución."""
+    by_submission = {s.id: s for s in ledger.submissions(project=project)}
+    active = []
+    for record in ledger.runs(project=project):
+        if record.state in ("PENDING", "RUNNING"):
+            submission = by_submission.get(record.submission_id)
+            if submission and submission.array_job_id and submission.array_job_id not in active:
+                active.append(str(submission.array_job_id))
+    return active
+
+
 def cmd_cancel(args) -> int:
     spec = _load(args)
     ledger = open_ledger(spec)
     backend = _backend_for(args, spec)
-    job_id = args.array_job_id
-    if not job_id:
-        submissions = [s for s in ledger.submissions(project=spec.project) if s.array_job_id]
-        if not submissions:
-            print("no hay envíos registrados", file=sys.stderr)
+    if args.array_job_id:
+        job_ids = [args.array_job_id]
+    else:
+        job_ids = _active_job_ids(ledger, spec.project)
+        if not job_ids:
+            print("no hay job arrays activos que cancelar", file=sys.stderr)
             return 1
-        job_id = str(submissions[0].array_job_id)
-    try:
-        backend.cancel(job_id)
-    except BackendError as exc:
-        print(f"error al cancelar: {exc}", file=sys.stderr)
-        return 1
+    for job_id in job_ids:
+        try:
+            backend.cancel(job_id)
+        except BackendError as exc:
+            print(f"error al cancelar {job_id}: {exc}", file=sys.stderr)
+            return 1
     # el libro debe reflejar la cancelación, no quedarse en PENDING
     result = sync_states(ledger, backend, project=spec.project)
-    print(f"cancelado {job_id} · {result['updated']} tareas actualizadas en el libro")
+    print(f"cancelado {', '.join(job_ids)} · {result['updated']} tareas actualizadas en el libro")
     return 0
 
 
@@ -413,6 +494,129 @@ def cmd_mock(args) -> int:
     return 0
 
 
+def cmd_clusters(args) -> int:
+    """Lista los perfiles de clúster incluidos."""
+    if args.json:
+        print(json.dumps({k: p.as_dict() for k, p in PROFILES.items()}, indent=2,
+                         ensure_ascii=False))
+        return 0
+    rows = []
+    for profile in PROFILES.values():
+        rules = []
+        if profile.requires_account:
+            rules.append("account")
+        if profile.requires_qos:
+            rules.append("qos")
+        rows.append([
+            profile.name, profile.title, profile.centre, profile.login or "—",
+            profile.partition or "—", profile.max_array_size or "?",
+            "+".join(rules) or "—",
+        ])
+    print(text_table(["perfil", "máquina", "centro", "login", "partición",
+                      "max array", "obligatorio"], rows,
+                     ["l", "l", "l", "l", "l", "r", "l"]))
+    if args.name:
+        profile = get_profile(args.name)
+        print()
+        for note in profile.notes:
+            print(f"· {note}")
+        if profile.setup_hint:
+            print(f"· software: {profile.setup_hint}")
+        if profile.docs:
+            print(f"· documentación: {profile.docs}")
+        if profile.verified:
+            print(f"· comprobado: {profile.verified}")
+    else:
+        print("\n'?' = sin comprobar: `slurmscope probe` lo lee del clúster.")
+        print("detalle de un perfil: slurmscope clusters --name hercules")
+    return 0
+
+
+def cmd_probe(args) -> int:
+    """Pregunta al clúster por sus límites y los guarda en .slurmscope/probe.json."""
+    spec = _load(args)
+    backend = _backend_for(args, spec)
+    if backend.name == "mock":
+        print("el simulador no tiene nada que sondear", file=sys.stderr)
+        return 1
+    if isinstance(backend, RemoteSlurm):
+        runner = lambda argv: backend.transport.run(argv, in_project=False)  # noqa: E731
+    else:
+        runner = backend._run
+    result = probe_cluster(runner)
+    (state_dir(spec) / "probe.json").write_text(
+        json.dumps(result.as_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2, ensure_ascii=False))
+        return 0
+    print(f"clúster        : {backend.name}")
+    print(f"SLURM          : {result.slurm_version or '?'}")
+    print(f"MaxArraySize   : {result.max_array_size or '?'}"
+          f"   (en uso: {spec.cluster.effective_max_array_size()})")
+    print(f"MaxJobCount    : {result.max_job_count or '?'}")
+    print(f"Python (login) : {result.python or '?'}")
+    if result.partitions:
+        print()
+        print(text_table(["partición", "defecto", "estado", "límite", "libres", "nodos"],
+                         [[p["name"], p["default"], p["state"], p["time_limit"],
+                           p["idle_nodes"], p["total_nodes"]] for p in result.partitions],
+                         ["l", "l", "l", "r", "r", "r"]))
+    if result.associations:
+        print()
+        print(text_table(["cuenta", "partición", "qos"],
+                         [[a["account"], a["partition"] or "(todas)", a["qos"]]
+                          for a in result.associations]))
+    if (result.max_array_size and
+            result.max_array_size != spec.cluster.effective_max_array_size()):
+        print(f"\naviso: el clúster dice MaxArraySize={result.max_array_size}; "
+              f"añade 'cluster.max_array_size: {result.max_array_size}' a la especificación")
+    for warning in result.warnings:
+        print(f"aviso: {warning}", file=sys.stderr)
+    return 0
+
+
+def _remote(args, spec: SweepSpec) -> RemoteSlurm:
+    backend = _backend_for(args, spec)
+    if not isinstance(backend, RemoteSlurm):
+        raise ConfigError("esta orden necesita un clúster remoto: define 'cluster.host'")
+    return backend
+
+
+def cmd_push(args) -> int:
+    spec = _load(args)
+    backend = _remote(args, spec)
+    out = backend.transport.push(spec.source.parent, excludes=spec.cluster.push_exclude)
+    changed = [line for line in out.splitlines() if line.strip()]
+    print(f"subido a {backend.transport.host}:{backend.transport.remote_dir} "
+          f"· {len(changed)} cambios")
+    return 0
+
+
+def cmd_pull(args) -> int:
+    spec = _load(args)
+    backend = _remote(args, spec)
+    what = ["results"] + (["logs"] if args.logs else [])
+    out = backend.transport.pull(spec.source.parent, what=what)
+    changed = [line for line in out.splitlines() if line.strip()]
+    print(f"descargado {', '.join(what)} de {backend.transport.host} · {len(changed)} cambios")
+    return 0
+
+
+def cmd_serve(args) -> int:
+    from .web import serve
+
+    directories = args.project or [args.directory or "."]
+    return serve(
+        [Path(d) for d in directories],
+        host=args.host,
+        port=args.port,
+        sync_interval=args.sync_interval,
+        backend=getattr(args, "backend", None) or "auto",
+        demo_tick=args.demo_tick,
+    )
+
+
 def cmd_version(args) -> int:
     print(f"slurmscope {__version__}")
     return 0
@@ -431,7 +635,7 @@ def _common_flags() -> argparse.ArgumentParser:
     common.add_argument("-C", "--directory", default=argparse.SUPPRESS)
     common.add_argument("-s", "--spec", default=argparse.SUPPRESS)
     common.add_argument(
-        "--backend", default=argparse.SUPPRESS, choices=["slurm", "mock"]
+        "--backend", default=argparse.SUPPRESS, choices=["auto", "slurm", "ssh", "mock"]
     )
     common.add_argument("--mock-parallel", type=int, default=argparse.SUPPRESS)
     common.add_argument("--fail-rate", type=float, default=argparse.SUPPRESS)
@@ -445,7 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[_common_flags()],
     )
     parser.add_argument("--version", action="version", version=f"slurmscope {__version__}")
-    parser.set_defaults(directory=None, spec=None, backend="slurm", mock_parallel=4, fail_rate=0.0)
+    parser.set_defaults(directory=None, spec=None, backend="auto", mock_parallel=4, fail_rate=0.0)
 
     for action in parser._actions:  # los globales también aceptan valor por defecto real
         if action.dest in {"directory", "spec", "backend", "mock_parallel", "fail_rate"}:
@@ -515,6 +719,34 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("mock", "avanza el clúster simulado (segundos)")
     p.add_argument("--advance", type=float, required=True)
     p.set_defaults(func=cmd_mock)
+
+    p = add("clusters", "perfiles de clúster incluidos (RES, Hércules…)")
+    p.add_argument("--name", help="detalle de un perfil")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_clusters)
+
+    p = add("probe", "lee del clúster sus límites, particiones y cuentas")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_probe)
+
+    p = add("push", "sube el proyecto al clúster remoto (rsync)")
+    p.set_defaults(func=cmd_push)
+
+    p = add("pull", "descarga los resultados del clúster remoto (rsync)")
+    p.add_argument("--logs", action="store_true", help="descarga también los logs")
+    p.set_defaults(func=cmd_pull)
+
+    p = add("serve", "panel web de uno o varios barridos")
+    p.add_argument("--project", action="append", metavar="DIR",
+                   help="directorio de un barrido (repetible)")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8120)
+    p.add_argument("--sync-interval", type=float, default=60.0,
+                   help="segundos entre sincronizaciones con el clúster (0 = nunca)")
+    p.add_argument("--demo-tick", type=float, default=0.0, metavar="S",
+                   help="solo simulador: avanza S segundos simulados en cada sincronización "
+                        "y relanza el barrido cuando acaba (demostraciones)")
+    p.set_defaults(func=cmd_serve)
 
     p = add("version", "muestra la versión")
     p.set_defaults(func=cmd_version)

@@ -1,5 +1,23 @@
 # Historial de cambios
 
+## 1.1.0 — 2026-10-17
+
+- Perfiles de clúster (`cluster.profile`): Hércules, MareNostrum 5 GPP y ACC,
+  FinisTerrae III, Tirant, Picasso, Caléndula y genérico. Solo datos comprobados.
+- Backend `ssh`: SlurmScope corre en local y controla el clúster por SSH; subida del
+  proyecto con `rsync` (sin borrar en destino) y `pull` de resultados y logs.
+- Troceo automático de barridos que superan `MaxArraySize` (offset por trozo).
+- `slurmscope probe`: versión de SLURM, `MaxArraySize`, particiones, cuentas y QoS.
+- `slurm.account` y `slurm.qos`, validadas contra inyección de directivas; las reglas
+  obligatorias del centro se comprueban antes de enviar.
+- La partición por defecto la decide el perfil o el clúster (antes, `standard` fijo).
+- El script lee el fichero de comandos con ruta relativa: vale igual en la copia remota.
+- Panel web `slurmscope serve`, de solo lectura, con varios barridos y modo demo protegido.
+- `cancel` cancela todos los job arrays activos del barrido.
+- Corregido: el recuento por estado contaba dos veces las ejecuciones relanzadas.
+- Agregado de métricas con mínimo y máximo.
+- 133 casos de prueba; verificado en Hércules real.
+
 ## 1.0.0 — 2026-10-16
 
 Primera versión de la obra. Incluye:

@@ -144,7 +144,14 @@ class Ledger:
         runs: Sequence[Any],
         array_job_id: Optional[str] = None,
         commands_file: Optional[str] = None,
+        task_offset: int = 0,
     ) -> int:
+        """Registra un envío y sus tareas en estado PENDING.
+
+        ``task_offset`` es el desplazamiento del trozo cuando el barrido se envía en
+        varios job arrays: la ejecución ``index`` es la tarea ``index - task_offset``
+        de su array, que es el índice que devuelven ``squeue`` y ``sacct``.
+        """
         with closing(self._connect()) as conn:
             cur = conn.execute(
                 "INSERT INTO submissions (project, backend, array_job_id, commands_file,"
@@ -159,7 +166,7 @@ class Ledger:
                 rows.append(
                     (
                         submission_id,
-                        int(getattr(run, "index", 0)),
+                        int(getattr(run, "index", 0)) - int(task_offset),
                         str(getattr(run, "key", "")),
                         getattr(run, "run_dir", None),
                         json.dumps(params, ensure_ascii=False, sort_keys=True),
@@ -257,15 +264,24 @@ class Ledger:
             return [RunRecord.from_row(r) for r in conn.execute(query, args)]
 
     def counts(self, project: Optional[str] = None) -> Dict[str, int]:
-        query = (
-            "SELECT r.state AS state, COUNT(*) AS n FROM runs r "
-            "JOIN submissions s ON s.id = r.submission_id"
+        """Recuento por estado del registro más reciente de cada ejecución.
+
+        Si una ejecución se ha enviado varias veces (p. ej. se relanzan las fallidas),
+        cuenta una sola vez, con su último estado: así el avance no supera el total ni
+        un fallo ya corregido sigue contando como fallo.
+        """
+        inner = (
+            "SELECT MAX(r2.id) FROM runs r2 JOIN submissions s2 ON s2.id = r2.submission_id"
         )
         args: List[Any] = []
         if project:
-            query += " WHERE s.project = ?"
+            inner += " WHERE s2.project = ?"
             args.append(project)
-        query += " GROUP BY r.state"
+        inner += " GROUP BY r2.run_key"
+        query = (
+            "SELECT r.state AS state, COUNT(*) AS n FROM runs r "
+            f"WHERE r.id IN ({inner}) GROUP BY r.state"
+        )
         with closing(self._connect()) as conn:
             return {row["state"]: row["n"] for row in conn.execute(query, args)}
 

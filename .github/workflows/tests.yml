@@ -1,0 +1,24 @@
+name: pruebas
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Auditoría
+        run: python scripts/audit.py --check
+      - name: Pruebas (sin dependencias)
+        run: PYTHONPATH=. python -m unittest discover -s tests -t tests -v
+      - name: Demostración de extremo a extremo
+        run: bash examples/demo.sh > /dev/null

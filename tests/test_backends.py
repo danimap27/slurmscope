@@ -56,7 +56,7 @@ class TestRealSlurm(unittest.TestCase):
                 return "5316479;cluster\n"
             return ""
 
-        self.backend = RealSlurm(user="dmartin", runner=runner)
+        self.backend = RealSlurm(user="usuario", runner=runner)
 
     def test_submit(self):
         job_id = self.backend.submit(Path("plan/submit.slurm"), 8, job_name="qtl")
