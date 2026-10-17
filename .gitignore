@@ -1,0 +1,22 @@
+# Artefactos de ejecución
+.slurmscope/
+plan/
+logs/
+results/
+reports/
+registro/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Editores y sistema
+.vscode/
+.idea/
+*.swp
+.DS_Store
