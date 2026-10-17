@@ -7,9 +7,9 @@ cómo se carga el software y desde dónde se entra. Un perfil recoge esas reglas
 que la especificación no tenga que repetirlas, y :func:`probe_cluster` las lee del
 propio clúster cuando un dato no se conoce de antemano.
 
-Solo se incluyen en los perfiles datos comprobados (en el clúster o en la guía
-oficial del centro). Lo que no se ha podido comprobar se deja vacío a propósito: es
-preferible preguntar al clúster con ``slurmscope probe`` que suponer un valor.
+Los perfiles viven en :mod:`slurmscope.clusters_data`, con la fuente de cada dato.
+Lo que la documentación no dice se deja vacío a propósito: es preferible preguntar al
+clúster con ``slurmscope probe`` que suponer un valor.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from .clusters_data import PROFILES, ClusterProfile
+
 # Valor por defecto de SLURM para MaxArraySize (índices 0..1000). Se usa solo
 # cuando ni el perfil ni la especificación dicen otra cosa.
 SLURM_DEFAULT_MAX_ARRAY_SIZE = 1001
@@ -25,141 +27,6 @@ SLURM_DEFAULT_MAX_ARRAY_SIZE = 1001
 
 class ClusterConfigError(ValueError):
     """Configuración de clúster inválida."""
-
-
-@dataclass(frozen=True)
-class ClusterProfile:
-    """Reglas conocidas de un centro de supercomputación."""
-
-    name: str
-    title: str
-    centre: str
-    login: Optional[str] = None
-    partition: Optional[str] = None
-    max_array_size: Optional[int] = None
-    requires_account: bool = False
-    requires_qos: bool = False
-    qos_examples: Sequence[str] = ()
-    setup_hint: str = ""
-    notes: Sequence[str] = ()
-    docs: str = ""
-    verified: str = ""
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "title": self.title,
-            "centre": self.centre,
-            "login": self.login,
-            "partition": self.partition,
-            "max_array_size": self.max_array_size,
-            "requires_account": self.requires_account,
-            "requires_qos": self.requires_qos,
-            "qos_examples": list(self.qos_examples),
-            "setup_hint": self.setup_hint,
-            "notes": list(self.notes),
-            "docs": self.docs,
-            "verified": self.verified,
-        }
-
-
-PROFILES: Dict[str, ClusterProfile] = {
-    "hercules": ClusterProfile(
-        name="hercules",
-        title="Hércules",
-        centre="CICA (Sevilla)",
-        login="login.spc.cica.es",
-        partition="standard",
-        max_array_size=500,
-        setup_hint="module load Miniconda3 && source activate <entorno>",
-        notes=(
-            "Hace falta la VPN del CICA activa.",
-            "Particiones: standard (por defecto) y gpu (A100 40 GB).",
-            "El Python del nodo de login es 3.6: SlurmScope se ejecuta en tu máquina "
-            "y habla con el clúster por SSH.",
-            "No usar 'conda activate' en scripts: 'source activate' tras cargar el módulo.",
-        ),
-        docs="https://www.cica.es/wp-content/uploads/2025/11/"
-        "Manual-de-usuario-para-Cl%C3%BAster-H%C3%A9rcules-CICA.pdf",
-        verified="2026-10-17, scontrol show config (SLURM 22.05.2, MaxArraySize=500)",
-    ),
-    "marenostrum5-gpp": ClusterProfile(
-        name="marenostrum5-gpp",
-        title="MareNostrum 5 (GPP, CPU)",
-        centre="BSC-CNS (Barcelona) · RES",
-        login="glogin1.bsc.es",
-        requires_account=True,
-        requires_qos=True,
-        qos_examples=("gp_resa", "gp_resb", "gp_resc", "gp_debug"),
-        notes=(
-            "Sin --account y --qos el envío se rechaza.",
-            "La cuenta es el grupo Unix del proyecto: 'bsc_project list'.",
-            "Las QoS disponibles se consultan con 'bsc_queues'.",
-            "La partición la determina la QoS: no hace falta indicarla.",
-        ),
-        docs="https://www.bsc.es/supportkc/docs/MareNostrum5/slurm",
-        verified="guía oficial del BSC (consultada 2026-10-17)",
-    ),
-    "marenostrum5-acc": ClusterProfile(
-        name="marenostrum5-acc",
-        title="MareNostrum 5 (ACC, GPU)",
-        centre="BSC-CNS (Barcelona) · RES",
-        login="alogin1.bsc.es",
-        requires_account=True,
-        requires_qos=True,
-        qos_examples=("acc_resa", "acc_resb", "acc_resc", "acc_debug"),
-        notes=(
-            "Sin --account y --qos el envío se rechaza.",
-            "Pide las GPU con extra_sbatch, p. ej. '#SBATCH --gres=gpu:1'.",
-        ),
-        docs="https://www.bsc.es/supportkc/docs/MareNostrum5/slurm",
-        verified="guía oficial del BSC (consultada 2026-10-17)",
-    ),
-    "finisterrae3": ClusterProfile(
-        name="finisterrae3",
-        title="FinisTerrae III",
-        centre="CESGA (Santiago) · RES",
-        qos_examples=("class_a", "class_b", "class_c"),
-        notes=(
-            "La QoS se asigna automáticamente según los recursos pedidos: no la "
-            "indiques salvo que tu proyecto RES lo requiera (class_a/b/c).",
-            "Límites de tu cuenta: comando 'batchlim'.",
-        ),
-        docs="https://cesga-docs.gitlab.io/ft3-user-guide/batch_qos.html",
-        verified="guía oficial del CESGA (consultada 2026-10-17)",
-    ),
-    "tirant": ClusterProfile(
-        name="tirant",
-        title="Tirant",
-        centre="Universitat de València · RES",
-        login="tirant.uv.es",
-        notes=(
-            "El SIUV anunció el cierre temporal del puerto 22 para accesos desde fuera "
-            "de la UV (30-04-2026): comprueba el acceso antes de enviar.",
-        ),
-        docs="https://www.uv.es/tirant/Manuales/Tirant3_user_manual.pdf",
-        verified="manual de usuario de Tirant 3 (consultado 2026-10-17)",
-    ),
-    "picasso": ClusterProfile(
-        name="picasso",
-        title="Picasso",
-        centre="SCBI, Universidad de Málaga · RES",
-        notes=("Configura el host en 'cluster.host' y ejecuta 'slurmscope probe'.",),
-        docs="https://www.scbi.uma.es/web/resources/user_manual/",
-    ),
-    "calendula": ClusterProfile(
-        name="calendula",
-        title="Caléndula",
-        centre="SCAYLE (León) · RES",
-        notes=("Configura el host en 'cluster.host' y ejecuta 'slurmscope probe'.",),
-    ),
-    "generic": ClusterProfile(
-        name="generic",
-        title="SLURM genérico",
-        centre="cualquier clúster SLURM",
-        notes=("Sin reglas propias: usa 'slurmscope probe' para leer los límites.",),
-    ),
-}
 
 
 def get_profile(name: Optional[str]) -> ClusterProfile:
@@ -188,8 +55,11 @@ class ClusterConfig:
     max_array_size: Optional[int] = None
     ssh_options: List[str] = field(default_factory=list)
     push_exclude: List[str] = field(default_factory=list)
+    # "res": las horas vienen de una actividad de la RES → partición/QoS RES del perfil
+    allocation: Optional[str] = None
 
-    KNOWN = ("profile", "host", "remote_dir", "max_array_size", "ssh_options", "push_exclude")
+    KNOWN = ("profile", "host", "remote_dir", "max_array_size", "ssh_options",
+             "push_exclude", "allocation")
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "ClusterConfig":
@@ -226,7 +96,14 @@ class ClusterConfig:
         if remote_dir is not None and not isinstance(remote_dir, str):
             raise ClusterConfigError("cluster.remote_dir debe ser una cadena")
 
+        allocation = data.get("allocation")
+        if allocation is not None:
+            allocation = str(allocation).strip().lower()
+            if allocation not in ("res", "centro"):
+                raise ClusterConfigError("cluster.allocation debe ser 'res' o 'centro'")
+
         return cls(
+            allocation=allocation,
             profile=profile,
             host=host.strip() if host else None,
             remote_dir=remote_dir,
@@ -260,6 +137,11 @@ class ClusterConfig:
             raise ClusterConfigError("cluster.remote_dir no puede ser la raíz ni $HOME")
         if ".." in path.split("/"):
             raise ClusterConfigError("cluster.remote_dir no puede contener '..'")
+        if not re.match(r"^[A-Za-z0-9_./~${}-]+$", path):
+            raise ClusterConfigError(
+                "cluster.remote_dir solo admite letras, números, '_', '-', '.', '/', '~' "
+                "y variables como $LUSTRE o $SCRATCH"
+            )
         return path
 
 
@@ -290,6 +172,83 @@ class ArrayChunk:
         if max_parallel and max_parallel > 0:
             spec += f"%{max_parallel}"
         return spec
+
+
+def compress_indices(indices: Sequence[int]) -> str:
+    """``[1, 2, 3, 7, 9, 10]`` → ``"1-3,7,9-10"`` (sintaxis de ``--array``)."""
+    values = sorted(set(int(i) for i in indices))
+    if not values:
+        raise ValueError("no hay índices que enviar")
+    parts: List[str] = []
+    start = prev = values[0]
+    for value in values[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        parts.append(f"{start}-{prev}" if prev != start else str(start))
+        start = prev = value
+    parts.append(f"{start}-{prev}" if prev != start else str(start))
+    return ",".join(parts)
+
+
+def parse_array_indices(spec: str) -> List[int]:
+    """``"1-3,7,9-12:2%4"`` → ``[1, 2, 3, 7, 9, 11]`` (ignora el ``%N``)."""
+    text = (spec or "").split("%", 1)[0].strip()
+    out: List[int] = []
+    for part in filter(None, (p.strip() for p in text.split(","))):
+        step = 1
+        if ":" in part:
+            part, step_text = part.split(":", 1)
+            step = int(step_text)
+        if "-" in part:
+            first, last = (int(x) for x in part.split("-", 1))
+            out.extend(range(first, last + 1, step))
+        else:
+            out.append(int(part))
+    return sorted(set(out))
+
+
+@dataclass(frozen=True)
+class ArrayBatch:
+    """Un envío: ejecuciones ``indices`` (1-based) que comparten ``offset``."""
+
+    offset: int
+    indices: tuple
+
+    @property
+    def tasks(self) -> List[int]:
+        return [i - self.offset for i in self.indices]
+
+    @property
+    def size(self) -> int:
+        return len(self.indices)
+
+    def array_spec(self, max_parallel: int = 0) -> str:
+        spec = compress_indices(self.tasks)
+        if max_parallel and max_parallel > 0:
+            spec += f"%{max_parallel}"
+        return spec
+
+    def describe(self) -> str:
+        return compress_indices(self.indices)
+
+
+def plan_batches(indices: Sequence[int], max_array_size: int) -> List[ArrayBatch]:
+    """Agrupa ejecuciones arbitrarias en job arrays válidos para ``MaxArraySize``.
+
+    Cada ventana ``[offset+1, offset+MaxArraySize-1]`` es un envío; dentro de ella,
+    las tareas usan índices ``run - offset``, siempre menores que ``MaxArraySize``.
+    Sirve igual para el envío inicial, para continuar por oleadas y para relanzar
+    solo las ejecuciones fallidas.
+    """
+    per_window = max(1, int(max_array_size) - 1)
+    windows: Dict[int, List[int]] = {}
+    for index in sorted(set(int(i) for i in indices)):
+        if index < 1:
+            raise ValueError(f"índice de ejecución inválido: {index}")
+        offset = ((index - 1) // per_window) * per_window
+        windows.setdefault(offset, []).append(index)
+    return [ArrayBatch(offset=o, indices=tuple(v)) for o, v in sorted(windows.items())]
 
 
 def plan_chunks(n_runs: int, max_array_size: int) -> List[ArrayChunk]:
@@ -323,6 +282,7 @@ class ProbeResult:
     max_job_count: Optional[int] = None
     partitions: List[Dict[str, str]] = field(default_factory=list)
     associations: List[Dict[str, str]] = field(default_factory=list)
+    qos: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     python: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
 
@@ -333,6 +293,7 @@ class ProbeResult:
             "max_job_count": self.max_job_count,
             "partitions": self.partitions,
             "associations": self.associations,
+            "qos": self.qos,
             "python": self.python,
             "warnings": self.warnings,
         }
@@ -389,11 +350,26 @@ def parse_associations(text: str) -> List[Dict[str, str]]:
     return out
 
 
+def parse_qos_table(text: str) -> Dict[str, Dict[str, Any]]:
+    """Interpreta ``sacctmgr -nP show qos format=name,maxwall,maxjobspu,maxsubmitpu``."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for line in text.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 4 or not parts[0] or " " in parts[0]:
+            continue
+        def number(value: str) -> Optional[int]:
+            return int(value) if value.strip().isdigit() else None
+        out[parts[0]] = {"max_wall": parts[1] or None, "max_jobs": number(parts[2]),
+                         "max_submit": number(parts[3])}
+    return out
+
+
 PROBE_SCRIPT = (
     "echo '##version'; sinfo --version 2>&1; "
     "echo '##config'; scontrol show config 2>&1 | grep -E '^(MaxArraySize|MaxJobCount) '; "
     "echo '##partitions'; sinfo -h -o '%P|%a|%l|%F' 2>&1; "
     "echo '##assoc'; sacctmgr -nP show assoc user=$USER format=account,partition,qos 2>&1; "
+    "echo '##qos'; sacctmgr -nP show qos format=name,maxwall,maxjobspu,maxsubmitpu 2>&1; "
     "echo '##python'; python3 --version 2>&1; echo '##end'"
 )
 
@@ -427,6 +403,7 @@ def parse_probe_output(text: str) -> ProbeResult:
 
     result.partitions = parse_sinfo_summary("\n".join(sections.get("partitions", [])))
     result.associations = parse_associations("\n".join(sections.get("assoc", [])))
+    result.qos = parse_qos_table("\n".join(sections.get("qos", [])))
     python = "\n".join(sections.get("python", [])).strip()
     match = re.search(r"Python\s+([\d.]+)", python)
     if match:
@@ -441,7 +418,7 @@ def probe_cluster(run: Callable[[Sequence[str]], str]) -> ProbeResult:
 
 def check_submission_rules(profile: ClusterProfile, account: Optional[str],
                            qos: Optional[str]) -> List[str]:
-    """Errores que el clúster daría al enviar, detectados antes de enviar."""
+    """Errores de cuenta/QoS obligatorias (atajo; las normas completas están en rules)."""
     problems: List[str] = []
     if profile.requires_account and not account:
         problems.append(

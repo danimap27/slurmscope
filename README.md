@@ -99,29 +99,57 @@ En `command` puedes usar cualquier parámetro del barrido y además `{index}`, `
 
 ## Clústeres: RES, Hércules y cualquier SLURM
 
-Todos los nodos de la RES consultados y Hércules usan SLURM. Lo que cambia de un centro a
-otro son sus reglas, y eso es lo que recoge cada perfil:
+Todos los nodos de la RES con guía pública y Hércules usan SLURM. Lo que cambia de un
+centro a otro son sus normas, y cada perfil las recoge a partir de la **documentación
+oficial del centro**, con la fuente de cada dato. Hay 20 perfiles: los 14 nodos de la
+RES, Hércules, Albaicín, DIPC y uno genérico.
 
-| Perfil | Máquina | Login | Reglas |
-|---|---|---|---|
-| `hercules` | Hércules · CICA | `login.spc.cica.es` (VPN) | partición `standard`, `MaxArraySize=500` |
-| `marenostrum5-gpp` | MareNostrum 5 GPP · BSC | `glogin1.bsc.es` | `account` y `qos` obligatorias (`gp_resa/b/c`) |
-| `marenostrum5-acc` | MareNostrum 5 ACC · BSC | `alogin1.bsc.es` | `account` y `qos` obligatorias (`acc_resa/b/c`), GPU con `--gres` |
-| `finisterrae3` | FinisTerrae III · CESGA | — | QoS automática (no indicarla salvo `class_a/b/c`) |
-| `tirant` | Tirant · UV | `tirant.uv.es` | — |
-| `picasso` | Picasso · UMA | — | usar `probe` |
-| `calendula` | Caléndula · SCAYLE | — | usar `probe` |
-| `generic` | cualquier SLURM | — | usar `probe` |
+**[Normas y buenas prácticas de cada centro → docs/centros.md](docs/centros.md)**
+(generado a partir de los perfiles con `python3 scripts/gen_centros.py`).
 
-Solo figuran datos comprobados (en el clúster o en la guía oficial del centro). Lo demás
-se deja vacío a propósito: `slurmscope probe` lo pregunta al clúster (versión de SLURM,
-`MaxArraySize`, particiones, cuentas y QoS) en una sola sesión SSH.
+```bash
+slurmscope clusters                    # todos los perfiles
+slurmscope clusters --name finisterrae3  # QoS, límites, normas y fuentes
+slurmscope check                       # tu barrido frente a las normas del centro
+slurmscope acknowledge                 # texto de agradecimiento para publicaciones
+```
+
+Antes de enviar, `check` (y `submit`, que **no envía nada si hay errores**) comprueba:
+
+- la cuenta, la QoS y la partición obligatorias;
+- `--time` frente al máximo de la QoS o partición, incluida la asignación automática
+  por tiempo de FinisTerrae III;
+- 20 CPU por GPU en MareNostrum 5 ACC;
+- que no haya descargas en centros sin internet;
+- que no se ejecute desde `$HOME` donde está desaconsejado;
+- el `MaxArraySize` real del clúster.
+
+El script generado añade lo que exige cada centro:
+
+- `--export=NONE` y `source /etc/profile.d/modules.sh` en Altamira;
+- `--constraint=cal` en Picasso;
+- `module purge` en LaPalma y TeideHPC;
+- `OMP_NUM_THREADS` y `SRUN_CPUS_PER_TASK` iguales a las CPU pedidas, en todos.
+
+**Oleadas por `MaxSubmit`.** En SLURM cada tarea de un array cuenta como un trabajo. En
+FinisTerrae III con `class_b`, como mucho 15 en cola. `submit` envía solo lo que cabe y
+`slurmscope resume` envía lo pendiente cuando avanza la cola; `resume --failed` relanza
+solo lo fallido.
+
+Con `cluster.allocation: res` se aplican la partición y la QoS RES de cada centro
+(Caléndula `res`/`class_a`, Altamira `res`/`res_a`, Pirineus `res_cpu`, Agustina `RES`,
+MareNostrum 5 `gp_resb`), salvo donde la QoS es automática.
+
+Lo que la documentación no dice no se supone: `slurmscope probe` lo pregunta al clúster
+en una sola sesión SSH (versión de SLURM, `MaxArraySize`, particiones, cuentas, QoS y sus
+límites), y eso prevalece sobre el perfil.
 
 ```yaml
 cluster:
   profile: hercules          # slurmscope clusters
   host: hercules-cica        # alias de ~/.ssh/config: activa el backend ssh
-  remote_dir: slurmscope/{project}
+  remote_dir: slurmscope/{project}   # admite $LUSTRE/..., $FSCRATCH/... (se resuelven allí)
+  # allocation: res          # horas de la RES: partición/QoS RES del centro
   # max_array_size: 500      # solo si quieres imponer otro valor
 slurm:
   # account: mi_proyecto     # obligatorio en MareNostrum 5
@@ -180,6 +208,9 @@ terminar. Sin ese fichero, el modo demo nunca escribe ni borra resultados.
 | `sync` | Vuelca el estado del clúster en el libro |
 | `cancel` | Cancela un job array |
 | `mock` | Avanza el clúster simulado (pruebas y demostraciones) |
+| `check` | Contrasta el barrido con las normas del centro |
+| `resume` | Envía lo pendiente por oleadas (`--failed` relanza lo fallido) |
+| `acknowledge` | Agradecimiento que exige el centro en publicaciones |
 | `clusters` | Perfiles de clúster incluidos (`--name` para el detalle) |
 | `probe` | Lee del clúster sus límites, particiones, cuentas y QoS |
 | `push` / `pull` | Sube el proyecto / descarga resultados del clúster remoto |
@@ -213,7 +244,7 @@ superior. Se muestran dos cifras distintas:
 make test          # o: PYTHONPATH=. python3 -m unittest discover -s tests -t tests
 ```
 
-133 casos de prueba sobre la biblioteca estándar (`unittest`), sin dependencias: lector
+165 casos de prueba sobre la biblioteca estándar (`unittest`), sin dependencias: lector
 YAML propio, validación de la especificación, expansión del barrido, generación del job
 array, libro de ejecuciones, parseo de `squeue`/`sacct`, simulador, inspección de
 resultados, estimaciones y un ciclo completo de integración por la CLI.
@@ -224,7 +255,9 @@ resultados, estimaciones y un ciclo completo de integración por la CLI.
 slurmscope/
   config.py      carga y valida la especificación
   matrix.py      producto cartesiano, comandos y script de job array
-  clusters.py    perfiles de centro, troceo de arrays y sondeo del clúster
+  clusters.py    configuración de clúster, troceo de arrays y sondeo
+  clusters_data.py  normas de cada centro, con sus fuentes
+  rules.py       comprobación previa al envío
   backends.py    SLURM local, SLURM por SSH y simulador determinista
   ledger.py      libro de ejecuciones (SQLite)
   sync.py        reconciliación libro ↔ clúster
@@ -237,7 +270,7 @@ slurmscope/
   cli.py         interfaz de línea de comandos
 docs/            memoria técnica y guía de registro
 examples/        demo reproducible y runner de ejemplo
-tests/           133 casos de prueba
+tests/           165 casos de prueba
 ```
 
 ## Licencia

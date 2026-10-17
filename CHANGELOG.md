@@ -1,5 +1,22 @@
 # Historial de cambios
 
+## 1.2.0 — 2026-10-17
+
+- Normas de 20 centros a partir de su documentación oficial (14 nodos RES, Hércules,
+  Albaicín, DIPC y genérico), con la fuente de cada dato: logins, acceso, QoS y
+  particiones con tiempos y límites, internet, directorio de trabajo y agradecimiento.
+- `slurmscope check`: comprobación previa al envío; `submit` no envía si hay errores.
+- Oleadas por `MaxSubmit` y `slurmscope resume` (`--failed` relanza lo fallido); lotes
+  con listas de índices (`--array=1-3,7,9`) que respetan `MaxArraySize`.
+- `probe` lee también las QoS y sus límites (`sacctmgr show qos`), que mandan sobre el perfil.
+- Script según el centro: `--export=NONE` + `modules.sh` (Altamira), `--constraint=cal`
+  (Picasso), `module purge` (LaPalma, TeideHPC); `OMP_NUM_THREADS` y
+  `SRUN_CPUS_PER_TASK` en todos; correo con `slurm.mail_user` / `slurm.mail_type`.
+- `cluster.allocation: res` y `cluster.remote_dir` con variables del centro ($LUSTRE…).
+- `slurmscope acknowledge` y `docs/centros.md` generado desde los perfiles.
+- Corregido: los resultados de un envío anterior en disco adelantaban el avance.
+- 165 casos de prueba; verificado de nuevo en Hércules.
+
 ## 1.1.0 — 2026-10-17
 
 - Perfiles de clúster (`cluster.profile`): Hércules, MareNostrum 5 GPP y ACC,

@@ -43,6 +43,8 @@ class SlurmOptions:
     setup: str = ""
     extra_sbatch: List[str] = field(default_factory=list)
     shebang: str = "#!/bin/bash"
+    mail_user: Optional[str] = None
+    mail_type: Optional[str] = None
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "SlurmOptions":
@@ -50,7 +52,7 @@ class SlurmOptions:
         known = {
             "job_name", "partition", "account", "qos", "time", "cpus_per_task",
             "mem", "max_parallel", "log_dir", "conda_base", "conda_env", "setup",
-            "extra_sbatch", "shebang",
+            "extra_sbatch", "shebang", "mail_user", "mail_type",
         }
         unknown = set(data) - known
         if unknown:
@@ -65,6 +67,19 @@ class SlurmOptions:
             kwargs["cpus_per_task"] = _as_int(kwargs["cpus_per_task"], "slurm.cpus_per_task")
         if "max_parallel" in kwargs:
             kwargs["max_parallel"] = _as_int(kwargs["max_parallel"], "slurm.max_parallel")
+        mail_type = kwargs.get("mail_type")
+        if mail_type not in (None, ""):
+            allowed = {"NONE", "BEGIN", "END", "FAIL", "REQUEUE", "ALL", "INVALID_DEPEND",
+                       "STAGE_OUT", "TIME_LIMIT", "TIME_LIMIT_90", "TIME_LIMIT_80",
+                       "TIME_LIMIT_50", "ARRAY_TASKS"}
+            parts = [p.strip().upper() for p in str(mail_type).split(",") if p.strip()]
+            if not parts or any(p not in allowed for p in parts):
+                raise ConfigError(f"slurm.mail_type no válido: {mail_type!r}")
+            kwargs["mail_type"] = ",".join(parts)
+        mail_user = kwargs.get("mail_user")
+        if mail_user not in (None, ""):
+            if not isinstance(mail_user, str) or not re.match(r"^[^@\s,;]+@[^@\s,;]+$", mail_user):
+                raise ConfigError(f"slurm.mail_user no es un correo válido: {mail_user!r}")
         for key in ("partition", "account", "qos"):
             value = kwargs.get(key)
             if value is None or value == "":
@@ -98,11 +113,30 @@ class SweepSpec:
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @property
+    def profile(self):
+        return get_profile(self.cluster.profile)
+
+    @property
     def effective_partition(self) -> Optional[str]:
-        """Partición a pedir: la de la especificación o, si no hay, la del perfil."""
+        """Partición a pedir: la de la especificación; si no, la RES del perfil cuando
+        las horas son de la RES; si no, la partición por defecto del perfil."""
         if self.slurm.partition:
             return self.slurm.partition
-        return get_profile(self.cluster.profile).partition
+        profile = self.profile
+        if self.cluster.allocation == "res" and profile.res_partition:
+            return profile.res_partition
+        return profile.partition
+
+    @property
+    def effective_qos(self) -> Optional[str]:
+        """QoS a pedir. En los centros que la asignan solos no se rellena nunca."""
+        if self.slurm.qos:
+            return self.slurm.qos
+        profile = self.profile
+        if (self.cluster.allocation == "res" and profile.res_qos
+                and not profile.qos_is_automatic):
+            return profile.res_qos
+        return None
 
     @property
     def n_runs(self) -> int:

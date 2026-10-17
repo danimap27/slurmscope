@@ -254,10 +254,29 @@ class SSHTransport:
         if not host or host.startswith("-"):
             raise BackendError(f"host SSH no válido: {host!r}")
         self.host = host
-        self.remote_dir = self._relative_to_home(remote_dir) if remote_dir else None
+        self._remote_dir_raw = self._relative_to_home(remote_dir) if remote_dir else None
+        self._remote_dir_resolved: Optional[str] = None
         self.ssh_options = list(ssh_options)
         self.timeout = timeout
         self._exec = runner or self._subprocess
+
+    @property
+    def remote_dir(self) -> Optional[str]:
+        """Directorio remoto. Las variables del centro ($LUSTRE, $SCRATCH, $FSCRATCH…)
+        se resuelven en el propio clúster la primera vez, con un shell de login."""
+        raw = self._remote_dir_raw
+        if not raw or "$" not in raw:
+            return raw
+        if self._remote_dir_resolved is None:
+            if "'" in raw or '"' in raw or "`" in raw:
+                raise BackendError("cluster.remote_dir contiene comillas")
+            out = self._exec([*self.ssh_base(), f"bash -lc 'printf %s \"{raw}\"'"]).strip()
+            if not out.startswith("/") or "$" in out:
+                raise BackendError(
+                    f"no pude resolver {raw!r} en {self.host} (¿existe esa variable?)"
+                )
+            self._remote_dir_resolved = out.rstrip("/")
+        return self._remote_dir_resolved
 
     @staticmethod
     def _relative_to_home(path: str) -> str:
@@ -445,7 +464,13 @@ class MockSlurm(BaseBackend):
         self._state["next_id"] += 1
         rng = random.Random(f"{self.seed}:{job_id}")
         tasks: Dict[str, Any] = {}
-        for index in range(1, int(n_tasks) + 1):
+        if array:
+            from .clusters import parse_array_indices
+
+            indices = parse_array_indices(array)
+        else:
+            indices = list(range(1, int(n_tasks) + 1))
+        for index in indices:
             duration = round(rng.uniform(self.min_seconds, self.max_seconds), 2)
             fails = rng.random() < self.failure_rate
             tasks[str(index)] = {

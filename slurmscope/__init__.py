@@ -4,7 +4,7 @@ Ejecución de múltiples experimentos (job arrays), panel interactivo de resulta
 historial de ejecuciones y estimación de tiempos a partir del histórico.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __author__ = "Daniel Martín Pérez"
 __license__ = "GPL-3.0-or-later"
 

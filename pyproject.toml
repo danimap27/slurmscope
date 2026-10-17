@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slurmscope"
-version = "1.1.0"
+version = "1.2.0"
 description = "Orquestador de barridos de experimentos en clústeres SLURM con panel de resultados, historial de ejecuciones y estimación de tiempos"
 readme = "README.md"
 requires-python = ">=3.9"

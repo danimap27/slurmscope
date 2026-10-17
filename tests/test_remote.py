@@ -268,8 +268,9 @@ class TestReglasDeEnvio(unittest.TestCase):
                              "cluster:\n  profile: marenostrum5-gpp\n")
         code, out = self._cli("submit", "--backend", "slurm", "-y")
         self.assertEqual(code, 2)
-        self.assertIn("exige una cuenta", out)
-        self.assertIn("exige una QoS", out)
+        self.assertIn("exige --account", out)
+        self.assertIn("exige --qos", out)
+        self.assertIn("gp_resa", out)
 
     def test_marenostrum_con_cuenta_y_qos(self):
         write_spec(self.dir, 'project: mn\ncommand: "echo {a}"\nsweep:\n  a: [1, 2]\n'

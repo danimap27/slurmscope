@@ -182,8 +182,9 @@ def render_slurm_script(
         header.append(f"#SBATCH --partition={partition}")
     if opts.account:
         header.append(f"#SBATCH --account={opts.account}")
-    if opts.qos:
-        header.append(f"#SBATCH --qos={opts.qos}")
+    qos = spec.effective_qos
+    if qos:
+        header.append(f"#SBATCH --qos={qos}")
     header.extend(
         [
             f"#SBATCH --time={opts.time}",
@@ -192,7 +193,19 @@ def render_slurm_script(
             f"#SBATCH --array={array_expr}",
         ]
     )
+    if opts.mail_user:
+        header.append(f"#SBATCH --mail-user={opts.mail_user}")
+    if opts.mail_type:
+        header.append(f"#SBATCH --mail-type={opts.mail_type}")
     header.extend(opts.extra_sbatch or [])
+    # directivas que exige el centro (p. ej. --export=NONE en Altamira), salvo que el
+    # usuario ya haya fijado esa misma opción
+    user_opts = {line.split("=", 1)[0].split()[1] for line in header[1:]
+                 if line.startswith("#SBATCH") and len(line.split()) > 1}
+    for directive in spec.profile.directives:
+        option = directive.split("=", 1)[0].split()[1]
+        if option not in user_opts:
+            header.append(directive)
 
     chunks_note = (
         f"# Se envía en trozos de hasta {max_array - 1} tareas (MaxArraySize={max_array})"
@@ -204,14 +217,23 @@ def render_slurm_script(
         "# ─────────────────────────────────────────────────────────────",
         f"# Generado por SlurmScope para el barrido '{spec.project}'",
         f"# {n_runs} ejecuciones · máximo {opts.max_parallel or 'sin tope'} en paralelo",
-        f"# Perfil de clúster: {spec.cluster.profile}",
+        f"# Perfil de clúster: {spec.cluster.profile} ({spec.profile.title})",
         chunks_note,
         "# ─────────────────────────────────────────────────────────────",
         "",
         "set -u",
         'cd "${SLURM_SUBMIT_DIR:-$PWD}"',
         "",
+        "# Hilos = CPU reservadas: evita sobresuscribir el nodo (OpenMP, BLAS, PyTorch).",
+        "# SRUN_CPUS_PER_TASK: srun ya no hereda --cpus-per-task (SLURM >= 22.05).",
+        'export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"',
+        'export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"',
+        "",
     ]
+    if spec.profile.preamble:
+        body.append(f"# Requisito de {spec.profile.title}")
+        body.extend(spec.profile.preamble)
+        body.append("")
     body.extend(_conda_block(spec))
     if spec.slurm.setup.strip():
         body.append(spec.slurm.setup.rstrip())

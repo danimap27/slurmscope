@@ -107,7 +107,10 @@ class Dashboard:
     def progress(self) -> float:
         if not self.n_total:
             return 0.0
-        done = max(self.counts.get("COMPLETED", 0), self.n_on_disk)
+        # Con envíos registrados manda el libro: los resultados en disco pueden ser de
+        # un envío anterior y adelantarían el avance de uno nuevo. Sin libro (barrido
+        # ejecutado fuera de SlurmScope), el disco es la única fuente.
+        done = self.counts.get("COMPLETED", 0) if self.counts else self.n_on_disk
         return min(100.0, 100.0 * done / self.n_total)
 
 
