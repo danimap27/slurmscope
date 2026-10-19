@@ -1,5 +1,21 @@
 # Historial de cambios
 
+## 1.3.0 — 2026-10-19
+
+- Contabilidad detallada de `sacct` (`Timelimit`, `AllocCPUS`, `ReqMem`, `MaxRSS`,
+  `TotalCPU`, estado original), con el uso de los pasos `.batch`/`.extern` agregado a cada
+  tarea. El libro se migra solo desde versiones anteriores.
+- `slurmscope tune`: eficiencia de CPU, memoria y tiempo, horas-núcleo ociosas, causas
+  de fallo y `--time`/`--mem`/`--cpus-per-task` recomendados (limitados al máximo de la QoS).
+- `slurmscope watch`: oleadas automáticas por `MaxSubmit` y reintentos solo de fallos
+  transitorios (`--retry N`), con `--pull`, `--max-hours` y `--once` para cron.
+- `resume --failed` avisa cuando los fallos son por tiempo o memoria agotados.
+- Panel web, menú e informe: secciones de eficiencia y de normas del centro, y causa
+  de cada fallo.
+- El simulador genera uso de recursos y causas de fallo verosímiles a partir del script.
+- Memoria técnica actualizada a 1.3.0 para el Registro de la Propiedad Intelectual.
+- 183 casos de prueba; contabilidad validada con datos reales de Hércules.
+
 ## 1.2.0 — 2026-10-17
 
 - Normas de 20 centros a partir de su documentación oficial (14 nodos RES, Hércules,

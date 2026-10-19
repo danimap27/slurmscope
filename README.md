@@ -174,6 +174,29 @@ script con `--array=1-N` y `SLURMSCOPE_OFFSET`, y cada tarea ejecuta la línea
 Verificado en Hércules el 17-10-2026: 6 ejecuciones en 2 job arrays (`5355721`,
 `5355722`), 6/6 `COMPLETED`, y la tarea 1 del segundo array ejecutó la línea 4.
 
+## Eficiencia y vigilancia
+
+```bash
+slurmscope tune                     # como seff, para todo el barrido
+slurmscope watch --retry 2 --pull   # lleva el barrido al final sin intervención
+```
+
+`tune` lee la contabilidad de SLURM (`Elapsed`, `Timelimit`, `AllocCPUS`, `ReqMem`,
+`MaxRSS`, `TotalCPU`) y muestra:
+
+- la eficiencia de CPU, memoria y tiempo;
+- las horas-núcleo ociosas;
+- la causa de cada fallo (tiempo agotado, memoria agotada, fallo del nodo, código de
+  salida…);
+- los valores concretos para el siguiente envío: `--time` (p95 + 25 %, sin pasar del
+  máximo de la QoS), `--mem` (máximo usado + 20 %, al menos +1 GB) y `--cpus-per-task`
+  si la eficiencia es baja.
+
+`watch` sincroniza, envía la siguiente oleada cuando hay hueco en la cola y, con `--retry
+N`, relanza hasta N veces **solo los fallos transitorios**. Los de tiempo o memoria
+agotados no se relanzan porque volverían a fallar. Con un clúster real consulta como
+mucho cada 2 minutos, y `--once` sirve para cron.
+
 ## Panel web
 
 ```bash
@@ -210,6 +233,8 @@ terminar. Sin ese fichero, el modo demo nunca escribe ni borra resultados.
 | `mock` | Avanza el clúster simulado (pruebas y demostraciones) |
 | `check` | Contrasta el barrido con las normas del centro |
 | `resume` | Envía lo pendiente por oleadas (`--failed` relanza lo fallido) |
+| `tune` | Eficiencia de recursos, causas de fallo y valores recomendados |
+| `watch` | Vigila el barrido: oleadas y reintentos hasta terminar |
 | `acknowledge` | Agradecimiento que exige el centro en publicaciones |
 | `clusters` | Perfiles de clúster incluidos (`--name` para el detalle) |
 | `probe` | Lee del clúster sus límites, particiones, cuentas y QoS |
@@ -244,7 +269,7 @@ superior. Se muestran dos cifras distintas:
 make test          # o: PYTHONPATH=. python3 -m unittest discover -s tests -t tests
 ```
 
-165 casos de prueba sobre la biblioteca estándar (`unittest`), sin dependencias: lector
+183 casos de prueba sobre la biblioteca estándar (`unittest`), sin dependencias: lector
 YAML propio, validación de la especificación, expansión del barrido, generación del job
 array, libro de ejecuciones, parseo de `squeue`/`sacct`, simulador, inspección de
 resultados, estimaciones y un ciclo completo de integración por la CLI.
@@ -258,6 +283,7 @@ slurmscope/
   clusters.py    configuración de clúster, troceo de arrays y sondeo
   clusters_data.py  normas de cada centro, con sus fuentes
   rules.py       comprobación previa al envío
+  efficiency.py  eficiencia de recursos y recomendaciones
   backends.py    SLURM local, SLURM por SSH y simulador determinista
   ledger.py      libro de ejecuciones (SQLite)
   sync.py        reconciliación libro ↔ clúster
@@ -270,7 +296,7 @@ slurmscope/
   cli.py         interfaz de línea de comandos
 docs/            memoria técnica y guía de registro
 examples/        demo reproducible y runner de ejemplo
-tests/           165 casos de prueba
+tests/           183 casos de prueba
 ```
 
 ## Licencia

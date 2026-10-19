@@ -84,6 +84,9 @@ def sync_states(
         row["seconds"] = entry.seconds if entry.seconds is not None else row.get("seconds")
         row["exit_code"] = entry.exit_code
         row["slurm_job_id"] = entry.job_id
+        for name, value in entry.usage().items():
+            if value is not None:
+                row[name] = value
 
     updated = ledger.apply_states(merged.values())
     return {"updated": updated, "queued": len(queued), "accounted": len(accounted),

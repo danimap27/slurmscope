@@ -51,6 +51,21 @@ class QueueEntry:
     exit_code: Optional[int] = None
     partition: str = ""
     detail: str = ""
+    # contabilidad detallada (sacct): estado original, recursos pedidos y usados
+    raw_state: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    timelimit_seconds: Optional[float] = None
+    alloc_cpus: Optional[int] = None
+    req_mem_mb: Optional[float] = None
+    max_rss_mb: Optional[float] = None
+    cpu_seconds: Optional[float] = None
+
+    USAGE_FIELDS = ("raw_state", "started_at", "ended_at", "timelimit_seconds",
+                    "alloc_cpus", "req_mem_mb", "max_rss_mb", "cpu_seconds")
+
+    def usage(self) -> Dict[str, Any]:
+        return {name: getattr(self, name) for name in self.USAGE_FIELDS}
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -75,6 +90,64 @@ def split_array_job_id(job_id: str) -> Tuple[Optional[str], Optional[int]]:
         if tail.isdigit():
             return base, int(tail)
     return text, None
+
+
+_SIZE_UNITS = {"K": 1 / 1024, "M": 1.0, "G": 1024.0, "T": 1024.0 ** 2, "P": 1024.0 ** 3}
+
+
+def parse_slurm_memory(text: str, cpus: Optional[int] = None,
+                       nodes: int = 1) -> Optional[float]:
+    """Memoria de SLURM en MB: ``4G``, ``4000M``, ``123456K``, ``4Gn``, ``2Gc``.
+
+    Los sufijos antiguos ``n`` (por nodo) y ``c`` (por CPU) de ``ReqMem`` se
+    convierten al total del trabajo cuando se conocen las CPU.
+    """
+    value = (text or "").strip()
+    if not value or value in ("0", "16?"):
+        return None
+    per_cpu = value.endswith("c")
+    if value[-1] in "nc":
+        value = value[:-1]
+    unit = value[-1].upper() if value[-1].isalpha() else "M"
+    number = value[:-1] if value[-1].isalpha() else value
+    try:
+        mb = float(number) * _SIZE_UNITS[unit]
+    except (ValueError, KeyError):
+        return None
+    if per_cpu and cpus:
+        mb *= cpus
+    return round(mb, 2)
+
+
+def parse_cpu_time(text: str) -> Optional[float]:
+    """``TotalCPU`` de sacct: ``[D-][HH:]MM:SS[.mmm]`` → segundos."""
+    value = (text or "").strip()
+    if not value:
+        return None
+    days = 0
+    if "-" in value:
+        head, value = value.split("-", 1)
+        if not head.isdigit():
+            return None
+        days = int(head)
+    parts = value.split(":")
+    try:
+        numbers = [float(p) for p in parts]
+    except ValueError:
+        return None
+    while len(numbers) < 3:
+        numbers.insert(0, 0.0)
+    hours, minutes, seconds = numbers[-3:]
+    return round(days * 86400 + hours * 3600 + minutes * 60 + seconds, 3)
+
+
+def parse_timelimit(text: str) -> Optional[float]:
+    value = (text or "").strip()
+    if not value or value.upper() in ("UNLIMITED", "PARTITION_LIMIT", "INVALID"):
+        return None
+    if "-" not in value and value.count(":") == 1:
+        value = "00:" + value
+    return parse_slurm_elapsed(value)
 
 
 class BackendError(RuntimeError):
@@ -202,42 +275,84 @@ class RealSlurm(BaseBackend):
             )
         return entries
 
+    ACCOUNTING_FORMAT = ("JobID,JobName,State,ExitCode,Elapsed,Start,End,"
+                         "Timelimit,AllocCPUS,ReqMem,MaxRSS,TotalCPU")
+
     def accounting(self, job_ids: Sequence[str]) -> List[QueueEntry]:
         if not job_ids:
             return []
-        fmt = "JobID,JobName,State,ExitCode,Elapsed,Start,End"
         out = self._run(
             ["sacct", "-j", ",".join(str(j) for j in job_ids), "--noheader",
-             "--parsable2", "--format=" + fmt]
+             "--parsable2", "--format=" + self.ACCOUNTING_FORMAT]
         )
-        entries: List[QueueEntry] = []
-        for line in out.splitlines():
-            parts = line.strip().split("|")
-            if len(parts) < 5:
-                continue
-            raw_id, name, state, exit_code, elapsed = parts[:5]
-            if "." in raw_id:  # pasos internos (.batch, .extern)
-                continue
-            array_job_id, task_index = split_array_job_id(raw_id)
-            code: Optional[int] = None
-            if exit_code and exit_code != "":
-                head = exit_code.split(":", 1)[0]
-                code = int(head) if head.isdigit() else None
-            entries.append(
-                QueueEntry(
-                    job_id=raw_id,
-                    array_job_id=array_job_id,
-                    task_index=task_index,
-                    name=name,
-                    state=normalise_state(state),
-                    seconds=parse_slurm_elapsed(elapsed),
-                    exit_code=code,
-                )
-            )
-        return entries
+        return parse_sacct(out)
 
     def cancel(self, job_id: str) -> None:
         self._run(["scancel", str(job_id)])
+
+
+def parse_sacct(out: str) -> List[QueueEntry]:
+    """Interpreta ``sacct --parsable2`` con :attr:`RealSlurm.ACCOUNTING_FORMAT`.
+
+    Cada tarea aparece en una línea propia y en las de sus pasos (``.batch``,
+    ``.extern``, ``.0``…). La memoria máxima (``MaxRSS``) y la CPU consumida
+    (``TotalCPU``) se reparten entre esas líneas: se toma el máximo de RSS y la CPU de
+    la línea principal, o la suma de los pasos si la principal no la trae.
+    Admite también el formato antiguo de 7 columnas.
+    """
+    entries: Dict[str, QueueEntry] = {}
+    step_rss: Dict[str, float] = {}
+    step_cpu: Dict[str, float] = {}
+    order: List[str] = []
+    for line in out.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 5:
+            continue
+        parts += [""] * (12 - len(parts))
+        raw_id, name, state, exit_code, elapsed, start, end = parts[:7]
+        timelimit, alloc, req_mem, max_rss, total_cpu = parts[7:12]
+        if "." in raw_id:  # paso interno: aporta uso de memoria y CPU
+            base = raw_id.split(".", 1)[0]
+            rss = parse_slurm_memory(max_rss)
+            if rss is not None:
+                step_rss[base] = max(step_rss.get(base, 0.0), rss)
+            cpu = parse_cpu_time(total_cpu)
+            if cpu is not None:
+                step_cpu[base] = step_cpu.get(base, 0.0) + cpu
+            continue
+        array_job_id, task_index = split_array_job_id(raw_id)
+        code: Optional[int] = None
+        if exit_code:
+            head = exit_code.split(":", 1)[0]
+            code = int(head) if head.isdigit() else None
+        cpus = int(alloc) if alloc.strip().isdigit() else None
+        entry = QueueEntry(
+            job_id=raw_id,
+            array_job_id=array_job_id,
+            task_index=task_index,
+            name=name,
+            state=normalise_state(state),
+            seconds=parse_slurm_elapsed(elapsed),
+            exit_code=code,
+            raw_state=(state or "").split()[0].upper() or None,
+            started_at=start if start and start not in ("Unknown", "None") else None,
+            ended_at=end if end and end not in ("Unknown", "None") else None,
+            timelimit_seconds=parse_timelimit(timelimit),
+            alloc_cpus=cpus,
+            req_mem_mb=parse_slurm_memory(req_mem, cpus=cpus),
+            max_rss_mb=parse_slurm_memory(max_rss),
+            cpu_seconds=parse_cpu_time(total_cpu) or None,
+        )
+        if raw_id not in entries:
+            order.append(raw_id)
+        entries[raw_id] = entry
+    for raw_id in order:
+        entry = entries[raw_id]
+        if raw_id in step_rss:
+            entry.max_rss_mb = max(entry.max_rss_mb or 0.0, step_rss[raw_id])
+        if entry.cpu_seconds is None and raw_id in step_cpu:
+            entry.cpu_seconds = round(step_cpu[raw_id], 3)
+    return [entries[raw_id] for raw_id in order]
 
 
 class SSHTransport:
@@ -438,7 +553,17 @@ class MockSlurm(BaseBackend):
 
     def _entry(self, job_id: str, task: Dict[str, Any]) -> QueueEntry:
         base, index = split_array_job_id(job_id)
+        usage = task.get("usage") or {}
+        terminal = task["state"] in (COMPLETED, FAILED)
         return QueueEntry(
+            raw_state=task.get("raw_state") or task["state"],
+            timelimit_seconds=usage.get("timelimit_seconds"),
+            alloc_cpus=usage.get("alloc_cpus"),
+            req_mem_mb=usage.get("req_mem_mb"),
+            max_rss_mb=usage.get("max_rss_mb") if terminal else None,
+            cpu_seconds=(round(usage["cpu_ratio"] * task["duration"] * usage["alloc_cpus"], 2)
+                         if terminal and usage.get("cpu_ratio") and usage.get("alloc_cpus")
+                         else None),
             job_id=job_id,
             array_job_id=base,
             task_index=task.get("index", index),
@@ -484,6 +609,7 @@ class MockSlurm(BaseBackend):
                 "started_at": None,
                 "ended_at": None,
             }
+        self._add_usage(job_id, tasks, script)
         self._state["jobs"][job_id] = {
             "name": job_name,
             "script": str(script),
@@ -522,6 +648,47 @@ class MockSlurm(BaseBackend):
                 task["state"] = "CANCELLED"
                 task["exit_code"] = None
         self._save()
+
+    @staticmethod
+    def _requested(script: Path) -> Dict[str, Any]:
+        """Recursos pedidos en el script (si se puede leer); valores típicos si no."""
+        found = {"alloc_cpus": 4, "req_mem_mb": 16384.0, "timelimit_seconds": 8 * 3600.0}
+        try:
+            text = Path(script).read_text(encoding="utf-8")
+        except OSError:
+            return found
+        for line in text.splitlines():
+            if not line.startswith("#SBATCH"):
+                continue
+            match = re.match(r"#SBATCH\s+--(cpus-per-task|mem|time)=(\S+)", line)
+            if not match:
+                continue
+            key, value = match.groups()
+            if key == "cpus-per-task" and value.isdigit():
+                found["alloc_cpus"] = int(value)
+            elif key == "mem":
+                found["req_mem_mb"] = parse_slurm_memory(value) or found["req_mem_mb"]
+            elif key == "time":
+                found["timelimit_seconds"] = parse_timelimit(value) or found["timelimit_seconds"]
+        return found
+
+    def _add_usage(self, job_id: str, tasks: Dict[str, Any], script: Path) -> None:
+        """Uso de recursos simulado y causa de los fallos (generador aparte, para no
+        alterar las duraciones ya deterministas)."""
+        requested = self._requested(script)
+        rng = random.Random(f"{self.seed}:{job_id}:uso")
+        for task in tasks.values():
+            usage = dict(requested)
+            usage["cpu_ratio"] = round(rng.uniform(0.35, 0.95), 3)
+            usage["max_rss_mb"] = round(requested["req_mem_mb"] * rng.uniform(0.15, 0.6), 1)
+            task["usage"] = usage
+            if task.get("will_fail"):
+                cause = rng.choice(["FAILED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY"])
+                task["raw_state"] = cause
+                if cause == "OUT_OF_MEMORY":
+                    usage["max_rss_mb"] = requested["req_mem_mb"]
+                if cause == "TIMEOUT":
+                    task["duration"] = min(task["duration"], requested["timelimit_seconds"])
 
     # ── avance de la simulación ──────────────────────────────────────────────
     def advance(self, seconds: float) -> float:

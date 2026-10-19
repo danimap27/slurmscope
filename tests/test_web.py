@@ -76,6 +76,9 @@ class TestPanelWeb(unittest.TestCase):
         self.assertTrue(states <= {"COMPLETED", "FAILED"}, states)
         self.assertGreater(data["on_disk"], 0)  # el modo demo escribe métricas
         self.assertIn("accuracy", data["metrics"])
+        self.assertEqual(data["efficiency"]["n_completed"], data["counts"].get("COMPLETED", 0))
+        self.assertIsInstance(data["findings"], list)
+        self.assertEqual(data["centre"]["title"], "SLURM genérico")
 
         _, headers, csv_text = self.server.get("/api/project/qtl-demo/runs.csv")
         self.assertIn("text/csv", headers["Content-Type"])

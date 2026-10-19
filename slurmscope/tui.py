@@ -19,6 +19,8 @@ from .report import (
     render_queue,
     render_results,
     render_runs,
+    render_efficiency_section,
+    render_rules,
     render_submissions,
 )
 
@@ -35,6 +37,8 @@ def build_sections(dash: Dashboard) -> List[Section]:
         ("5", "Estimación de tiempos", _render_estimate),
         ("6", "Envíos", render_submissions),
         ("7", "Fallos", render_failures),
+        ("8", "Eficiencia", render_efficiency_section),
+        ("9", "Normas del centro", render_rules),
     ]
 
 

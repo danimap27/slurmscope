@@ -48,6 +48,16 @@ CREATE INDEX IF NOT EXISTS idx_runs_key ON runs(run_key);
 CREATE INDEX IF NOT EXISTS idx_submissions_project ON submissions(project);
 """
 
+# Columnas añadidas en 1.3.0: uso de recursos según sacct (se migran solas)
+USAGE_COLUMNS = (
+    ("raw_state", "TEXT"),
+    ("timelimit_seconds", "REAL"),
+    ("alloc_cpus", "INTEGER"),
+    ("req_mem_mb", "REAL"),
+    ("max_rss_mb", "REAL"),
+    ("cpu_seconds", "REAL"),
+)
+
 PENDING = "PENDING"
 RUNNING = "RUNNING"
 COMPLETED = "COMPLETED"
@@ -111,12 +121,38 @@ class RunRecord:
     started_at: Optional[str]
     ended_at: Optional[str]
     seconds: Optional[float]
+    raw_state: Optional[str] = None
+    timelimit_seconds: Optional[float] = None
+    alloc_cpus: Optional[int] = None
+    req_mem_mb: Optional[float] = None
+    max_rss_mb: Optional[float] = None
+    cpu_seconds: Optional[float] = None
+
+    @property
+    def cause(self) -> Optional[str]:
+        """Causa del fallo legible a partir del estado original de SLURM."""
+        if self.state not in ("FAILED", "CANCELLED"):
+            return None
+        raw = (self.raw_state or "").upper()
+        if raw in ("TIMEOUT", "DEADLINE"):
+            return "tiempo agotado"
+        if raw in ("OUT_OF_MEMORY", "OOM"):
+            return "memoria agotada"
+        if raw in ("NODE_FAIL", "BOOT_FAIL"):
+            return "fallo del nodo"
+        if raw == "PREEMPTED":
+            return "desalojado"
+        if raw.startswith("CANCELLED") or self.state == "CANCELLED":
+            return "cancelado"
+        if self.exit_code:
+            return f"código de salida {self.exit_code}"
+        return "error de ejecución"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "RunRecord":
         data = {k: row[k] for k in row.keys()}
         data["params"] = json.loads(data.get("params") or "{}")
-        return cls(**{k: data[k] for k in cls.__dataclass_fields__})
+        return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
 
 
 class Ledger:
@@ -127,6 +163,10 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
             conn.executescript(SCHEMA)
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+            for column, kind in USAGE_COLUMNS:
+                if column not in existing:  # libros creados por versiones anteriores
+                    conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {kind}")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -210,12 +250,20 @@ class Ledger:
                         slurm_job_id= COALESCE(?, slurm_job_id),
                         started_at  = COALESCE(?, started_at),
                         ended_at    = COALESCE(?, ended_at),
+                        raw_state   = COALESCE(?, raw_state),
+                        timelimit_seconds = COALESCE(?, timelimit_seconds),
+                        alloc_cpus  = COALESCE(?, alloc_cpus),
+                        req_mem_mb  = COALESCE(?, req_mem_mb),
+                        max_rss_mb  = COALESCE(?, max_rss_mb),
+                        cpu_seconds = COALESCE(?, cpu_seconds),
                         updated_at  = ?
                     WHERE submission_id = ? AND task_index = ?
                     """,
                     (
                         state, exit_code, seconds, item.get("slurm_job_id"),
-                        started, ended, stamp, submission_id, int(index),
+                        started, ended,
+                        *(item.get(column) for column, _ in USAGE_COLUMNS),
+                        stamp, submission_id, int(index),
                     ),
                 )
                 updated += cur.rowcount
@@ -316,6 +364,20 @@ class Ledger:
             "p90": ordered[p90_index],
             "max": max(values),
         }
+
+    def latest(self, project: Optional[str] = None) -> Dict[str, RunRecord]:
+        """Último intento de cada ejecución, por clave."""
+        out: Dict[str, RunRecord] = {}
+        for record in self.runs(project=project):  # más reciente primero
+            out.setdefault(record.run_key, record)
+        return out
+
+    def attempts(self, project: Optional[str] = None) -> Dict[str, int]:
+        """Cuántas veces se ha enviado cada ejecución."""
+        out: Dict[str, int] = {}
+        for record in self.runs(project=project):
+            out[record.run_key] = out.get(record.run_key, 0) + 1
+        return out
 
     def failures(self, project: Optional[str] = None, limit: int = 20) -> List[RunRecord]:
         query = (

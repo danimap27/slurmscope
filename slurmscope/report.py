@@ -88,6 +88,8 @@ class Dashboard:
     queue: List[Any] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     scan_error: Optional[str] = None
+    findings: List[Any] = field(default_factory=list)
+    efficiency: Any = None
     generated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     # ── resumen numérico ─────────────────────────────────────────────────────
@@ -161,7 +163,23 @@ def build_dashboard(
         project=spec.project,
     )
 
+    findings: List[Any] = []
+    efficiency = None
+    try:
+        from .efficiency import analyse
+        from .rules import check_spec, effective_limits, load_probe, slurm_time_seconds
+
+        probe = load_probe(spec)
+        findings = check_spec(spec, len(runs), probe)
+        _, limits = effective_limits(spec, probe)
+        efficiency = analyse(list(ledger.latest(project=spec.project).values()), spec,
+                             slurm_time_seconds(limits.max_wall))
+    except Exception as exc:  # pragma: no cover - el panel no debe caerse por esto
+        warnings.append(f"no se pudieron evaluar normas/eficiencia ({exc})")
+
     return Dashboard(
+        findings=findings,
+        efficiency=efficiency,
         spec=spec,
         runs=runs,
         outcomes=outcomes,
@@ -318,14 +336,34 @@ def render_results(dash: Dashboard, limit: int = 30) -> str:
     return body
 
 
+def render_rules(dash: Dashboard) -> str:
+    from .rules import format_findings
+
+    profile = dash.spec.profile
+    head = f"{profile.title} · {profile.centre}" + (" · nodo RES" if profile.res_node else "")
+    lines = [head, "", format_findings(dash.findings)]
+    if profile.notes:
+        lines += ["", "Normas del centro:"] + [f"  · {n}" for n in profile.notes]
+    return "\n".join(lines)
+
+
+def render_efficiency_section(dash: Dashboard) -> str:
+    from .efficiency import render_efficiency
+
+    if dash.efficiency is None:
+        return "Sin datos de eficiencia."
+    return render_efficiency(dash.efficiency)
+
+
 def render_failures(dash: Dashboard) -> str:
     if not dash.failures:
         return "Sin fallos registrados."
     rows = [
-        [r.submission_id, r.task_index, r.run_key, r.exit_code, r.ended_at or ""]
+        [r.submission_id, r.task_index, r.run_key, r.cause or "", r.exit_code, r.ended_at or ""]
         for r in dash.failures
     ]
-    return text_table(["envío", "#", "ejecución", "código", "terminada"], rows, ["r", "r", "l", "r", "l"])
+    return text_table(["envío", "#", "ejecución", "causa", "código", "terminada"], rows,
+                      ["r", "r", "l", "l", "r", "l"])
 
 
 def render_submissions(dash: Dashboard) -> str:
@@ -384,6 +422,16 @@ def write_markdown(dash: Dashboard, path: Path) -> Path:
         "## Fallos",
         "```",
         render_failures(dash),
+        "```",
+        "",
+        "## Eficiencia de recursos",
+        "```",
+        render_efficiency_section(dash),
+        "```",
+        "",
+        "## Normas del centro",
+        "```",
+        render_rules(dash),
         "```",
         "",
     ]
@@ -450,9 +498,17 @@ def dashboard_payload(dash: Dashboard, ledger: Optional[Ledger] = None) -> Dict[
         ],
         "failures": [
             {"submission_id": r.submission_id, "task_index": r.task_index,
-             "key": r.run_key, "exit_code": r.exit_code, "ended_at": r.ended_at}
+             "key": r.run_key, "exit_code": r.exit_code, "ended_at": r.ended_at,
+             "cause": r.cause}
             for r in dash.failures
         ],
+        "findings": [f.as_dict() for f in dash.findings],
+        "efficiency": dash.efficiency.as_dict() if dash.efficiency is not None else None,
+        "centre": {
+            "title": spec.profile.title, "centre": spec.profile.centre,
+            "res_node": spec.profile.res_node, "notes": list(spec.profile.notes),
+            "docs": list(spec.profile.docs), "workdir": spec.profile.workdir_hint,
+        },
         "submissions": [
             {
                 "id": s.id,

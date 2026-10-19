@@ -136,7 +136,7 @@ class TestCicloCompleto(unittest.TestCase):
         ledger = Ledger(self.dir / ".slurmscope" / "ledger.db")
         dash = build_dashboard(spec, ledger, backend=None, sync=False)
         sections = build_sections(dash)
-        self.assertEqual(len(sections), 7)
+        self.assertEqual(len(sections), 9)
         for key, _label, _renderer in sections:
             self.assertTrue(render_section(dash, key))
 

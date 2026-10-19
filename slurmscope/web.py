@@ -556,11 +556,40 @@ function renderProject(d){
   }
   drawRuns();
 
+  const ef = d.efficiency, ce = d.centre || {}, fnd = d.findings || [];
+  const pct = x => x == null ? "—" : `${Math.round(100*x)} %`;
+  const LV = {error:"FAILED", aviso:"RUNNING", info:"PENDING"};
+  v.append(el("div", {class:"two"},
+    el("section", {}, el("h2", {}, "Eficiencia de recursos"),
+      !ef || (!ef.n_completed && !Object.keys(ef.causes||{}).length)
+        ? el("p", {class:"mute"}, "Aún no hay tareas terminadas con contabilidad (sacct).")
+        : el("div", {},
+            table(["indicador","valor"], [
+              ["tareas completadas", ef.n_completed], ["duración p95", fmtS(ef.p95_seconds)],
+              ["tiempo usado / pedido (mediana)", pct(ef.time_usage_median)],
+              ["eficiencia de CPU (mediana)", pct(ef.cpu_efficiency_median)],
+              ["memoria usada / pedida (mediana)", pct(ef.mem_efficiency_median)],
+              ["horas-núcleo ociosas", ef.wasted_core_hours ?? "—"]], [1]),
+            (ef.suggestions||[]).length ? el("div", {style:"margin-top:8px"},
+              el("b", {}, "Recomendado para el próximo envío"),
+              (ef.suggestions||[]).map(x => el("div", {class:"warn"},
+                `${x.option}: ${x.proposed} (ahora ${x.current}) · ${x.reason}`)))
+              : el("p", {class:"mute"}, "Sin cambios recomendados para el próximo envío."),
+            Object.keys(ef.causes||{}).length ? el("p", {}, "Fallos por causa: ",
+              Object.entries(ef.causes).map(([k,n]) => el("span", {class:"chip"}, `${k}: ${n}`))) : null)),
+    el("section", {}, el("h2", {}, `Normas del centro · ${ce.title || ""}`),
+      fnd.length ? fnd.map(f => el("div", {style:"margin:4px 0"}, el("span", {class:"st "+LV[f.level]}, f.level), " ", f.message))
+        : el("p", {class:"mute"}, "La especificación cumple las normas conocidas del centro."),
+      ce.workdir ? el("p", {}, el("b", {}, "Dónde trabajar: "), ce.workdir) : null,
+      el("ul", {style:"margin:6px 0;padding-left:18px"}, (ce.notes||[]).map(n => el("li", {}, n))),
+      (ce.docs||[]).length ? el("p", {class:"mute"}, "Fuentes: ",
+        (ce.docs||[]).map(u => el("a", {href:u, target:"_blank", rel:"noopener", style:"margin-right:8px"}, new URL(u).hostname))) : null)));
+
   const fails = d.failures || [], queue = d.queue || [];
   v.append(el("div", {class:"two"},
     el("section", {}, el("h2", {}, `Fallos recientes (${fails.length})`),
-      el("div", {class:"scroll", style:"max-height:280px"}, table(["envío","tarea","clave","salida"],
-        fails.map(f => [f.submission_id, f.task_index, f.key, f.exit_code ?? "—"]), [0,1,3]))),
+      el("div", {class:"scroll", style:"max-height:280px"}, table(["envío","tarea","clave","causa","salida"],
+        fails.map(f => [f.submission_id, f.task_index, f.key, f.cause || "—", f.exit_code ?? "—"]), [0,1,4]))),
     el("section", {}, el("h2", {}, `Cola del clúster (${queue.length})`),
       el("div", {class:"scroll", style:"max-height:280px"}, table(["job","estado","transcurrido","detalle"],
         queue.slice(0,200).map(q => [q.job_id, badge(q.state), fmtS(q.seconds), q.detail || ""]), [2])))));

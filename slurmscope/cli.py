@@ -2,7 +2,8 @@
 
 Comandos: ``init``, ``plan``, ``gen``, ``submit``, ``status``, ``menu``, ``queue``,
 ``results``, ``estimate``, ``report``, ``sync``, ``cancel``, ``mock``, ``clusters``,
-``probe``, ``push``, ``pull`` y ``serve``.
+``probe``, ``push``, ``pull``, ``serve``, ``check``, ``resume``, ``tune``, ``watch`` y
+``acknowledge``.
 """
 
 from __future__ import annotations
@@ -163,6 +164,36 @@ def run_status(ledger: Ledger, project: str) -> Dict[str, str]:
     for record in ledger.runs(project=project):  # más reciente primero
         latest.setdefault(record.run_key, record.state)
     return latest
+
+
+# Fallos que no se arreglan relanzando igual: hay que cambiar recursos (slurmscope tune)
+NOT_RETRYABLE = {"tiempo agotado", "memoria agotada", "cancelado"}
+
+
+def pending_indices(spec: SweepSpec, ledger: Ledger, runs: Sequence, retry_failed: bool,
+                    max_attempts: Optional[int] = None,
+                    only_transient: bool = False) -> List[int]:
+    """Ejecuciones por enviar: las nunca enviadas y, si se pide, las fallidas.
+
+    ``max_attempts`` limita los intentos por ejecución; ``only_transient`` excluye los
+    fallos por tiempo o memoria agotados, que volverían a fallar con los mismos recursos.
+    """
+    latest = ledger.latest(project=spec.project)
+    attempts = ledger.attempts(project=spec.project) if max_attempts else {}
+    out: List[int] = []
+    for run in runs:
+        record = latest.get(run.key)
+        if record is None:
+            out.append(run.index)
+            continue
+        if not retry_failed or record.state not in ("FAILED", "CANCELLED"):
+            continue
+        if only_transient and record.cause in NOT_RETRYABLE:
+            continue
+        if max_attempts and attempts.get(run.key, 0) >= max_attempts:
+            continue
+        out.append(run.index)
+    return out
 
 
 def queue_capacity(spec: SweepSpec, ledger: Ledger) -> Optional[int]:
@@ -411,10 +442,14 @@ def cmd_resume(args) -> int:
     backend = _backend_for(args, spec)
     if not args.no_sync:
         sync_states(ledger, backend, project=spec.project)
-    status = run_status(ledger, spec.project)
-    retry = {"FAILED", "CANCELLED"} if args.failed else set()
-    indices = [run.index for run in runs
-               if status.get(run.key) is None or status.get(run.key) in retry]
+    indices = pending_indices(spec, ledger, runs, retry_failed=args.failed)
+    if args.failed:
+        latest = ledger.latest(project=spec.project)
+        stuck = sum(1 for r in latest.values() if r.cause in ("tiempo agotado", "memoria agotada"))
+        if stuck:
+            print(f"aviso: {stuck} ejecuciones fallaron por tiempo o memoria agotados y "
+                  "volverán a fallar con los mismos recursos: revisa 'slurmscope tune'",
+                  file=sys.stderr)
     if not indices:
         print("no hay nada pendiente de enviar"
               + ("" if args.failed else " (usa --failed para relanzar las fallidas)"))
@@ -444,6 +479,127 @@ def cmd_resume(args) -> int:
     rest = len(indices) - len(to_send)
     print(f"enviadas {len(to_send)} ejecuciones" + (f" · quedan {rest}" if rest else ""))
     return 0
+
+
+def cmd_tune(args) -> int:
+    """Eficiencia de los recursos pedidos y valores recomendados (como seff, para todo)."""
+    from .efficiency import analyse, render_efficiency
+    from .rules import effective_limits, load_probe, slurm_time_seconds
+
+    spec = _load(args)
+    ledger = open_ledger(spec)
+    if not args.no_sync:
+        try:
+            sync_states(ledger, _backend_for(args, spec), project=spec.project)
+        except BackendError as exc:
+            print(f"aviso: no se pudo sincronizar ({exc}); uso el libro tal cual", file=sys.stderr)
+    _, limits = effective_limits(spec, load_probe(spec))
+    report = analyse(list(ledger.latest(project=spec.project).values()), spec,
+                     slurm_time_seconds(limits.max_wall))
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2, ensure_ascii=False))
+    else:
+        print(render_efficiency(report))
+    return 0
+
+
+def cmd_watch(args) -> int:
+    """Lleva el barrido hasta el final sin intervención.
+
+    En cada vuelta sincroniza con el clúster, envía la siguiente oleada cuando hay
+    hueco en la cola (``MaxSubmit``) y, con ``--retry N``, relanza hasta N veces los
+    fallos transitorios (no los de tiempo o memoria agotados, que necesitan otros
+    recursos). Con el simulador, cada vuelta avanza el reloj simulado en vez de esperar.
+    """
+    import time as _time
+
+    spec = _load(args)
+    runs = expand_runs(spec)
+    ledger = open_ledger(spec)
+    backend = _backend_for(args, spec)
+    simulated = backend.name == "mock"
+    interval = float(args.interval)
+    if not simulated and interval < 120:
+        print("aviso: --interval mínimo de 120 s con un clúster real (el login es compartido)",
+              file=sys.stderr)
+        interval = 120.0
+
+    if not simulated:
+        from .rules import format_findings, has_errors
+
+        findings = _findings(spec, len(runs))
+        if has_errors(findings):
+            print(format_findings([f for f in findings if f.level == "error"]), file=sys.stderr)
+            return 2
+        ok, reason = backend.available()
+        if not ok:
+            print(f"backend no disponible: {reason}", file=sys.stderr)
+            return 1
+        if not args.yes and not _confirm(
+                f"¿Vigilar y enviar por oleadas {len(runs)} ejecuciones en {backend.name}? [s/N] "):
+            print("cancelado")
+            return 1
+
+    max_attempts = 1 + max(0, args.retry)
+    deadline = _time.time() + args.max_hours * 3600 if args.max_hours else None
+    artifacts = None
+    pushed = False
+    rounds = 0
+    while True:
+        rounds += 1
+        if simulated and rounds > 1:
+            backend.advance(interval)
+        try:
+            sync_states(ledger, backend, project=spec.project)
+        except BackendError as exc:
+            print(f"aviso: {exc}", file=sys.stderr)
+        indices = pending_indices(spec, ledger, runs, retry_failed=args.retry > 0,
+                                  max_attempts=max_attempts, only_transient=True)
+        capacity = queue_capacity(spec, ledger)
+        to_send = indices if capacity is None else indices[:capacity]
+        sent = 0
+        if to_send:
+            if artifacts is None:
+                artifacts = _generate(spec, runs, force=True)
+            try:
+                submit_sweep(spec, backend, ledger, runs, artifacts, indices=to_send,
+                             log=lambda _m: None, push=not pushed)
+                pushed = True
+                sent = len(to_send)
+            except BackendError as exc:
+                print(f"aviso: no se pudo enviar ({exc}); se reintentará", file=sys.stderr)
+        counts = ledger.counts(project=spec.project)
+        active = counts.get("PENDING", 0) + counts.get("RUNNING", 0)
+        done = counts.get("COMPLETED", 0)
+        failed = counts.get("FAILED", 0) + counts.get("CANCELLED", 0)
+        stamp = _time.strftime("%H:%M:%S")
+        print(f"[{stamp}] vuelta {rounds} · completadas {done}/{len(runs)} · activas {active}"
+              f" · fallidas {failed}" + (f" · enviadas {sent}" if sent else "")
+              + (f" · por enviar {len(indices) - sent}" if len(indices) > sent else ""),
+              flush=True)
+        remaining = pending_indices(spec, ledger, runs, retry_failed=args.retry > 0,
+                                    max_attempts=max_attempts, only_transient=True)
+        if not active and not remaining:
+            break
+        if args.once:
+            return 0
+        if deadline and _time.time() >= deadline:
+            print("tiempo máximo de vigilancia alcanzado: retoma con 'slurmscope watch'")
+            return 3
+        if not simulated:
+            _time.sleep(interval)
+        elif rounds > 10000:  # pragma: no cover - salvaguarda
+            return 3
+
+    if args.pull and not simulated and isinstance(backend, RemoteSlurm):
+        backend.transport.pull(spec.source.parent, what=["results", "logs"])
+        print("resultados y logs descargados")
+    counts = ledger.counts(project=spec.project)
+    failed = counts.get("FAILED", 0) + counts.get("CANCELLED", 0)
+    print(f"barrido terminado: {counts.get('COMPLETED', 0)} completadas, {failed} fallidas")
+    if failed:
+        print("causas y recursos recomendados:  slurmscope tune")
+    return 1 if failed else 0
 
 
 def cmd_acknowledge(args) -> int:
@@ -903,6 +1059,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-sync", action="store_true")
     p.add_argument("--yes", "-y", action="store_true")
     p.set_defaults(func=cmd_resume)
+
+    p = add("tune", "eficiencia de CPU, memoria y tiempo, y valores recomendados")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--no-sync", action="store_true")
+    p.set_defaults(func=cmd_tune)
+
+    p = add("watch", "vigila el barrido: oleadas por MaxSubmit y reintentos hasta terminar")
+    p.add_argument("--interval", type=float, default=300.0,
+                   help="segundos entre vueltas (mínimo 120 con un clúster real)")
+    p.add_argument("--retry", type=int, default=0, metavar="N",
+                   help="relanza hasta N veces los fallos transitorios")
+    p.add_argument("--max-hours", type=float, default=0.0)
+    p.add_argument("--pull", action="store_true", help="descarga resultados y logs al terminar")
+    p.add_argument("--once", action="store_true", help="una sola vuelta (para cron)")
+    p.add_argument("--yes", "-y", action="store_true")
+    p.set_defaults(func=cmd_watch)
 
     p = add("acknowledge", "texto de agradecimiento que exige el centro en publicaciones")
     p.add_argument("--name", help="perfil (por defecto, el de la especificación)")
